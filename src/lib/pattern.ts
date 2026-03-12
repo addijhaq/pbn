@@ -48,7 +48,17 @@ interface Component {
   neighborCounts: Map<number, number>;
 }
 
+interface SceneMap {
+  cols: number;
+  rows: number;
+  tileSize: number;
+  scores: Float32Array;
+}
+
 const keyForPoint = (point: Point) => `${point.x},${point.y}`;
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
+const clamp01 = (value: number) => clamp(value, 0, 1);
 
 export const buildPathString = (loops: Point[][]) =>
   loops
@@ -134,6 +144,111 @@ const computeLabPixels = (imageData: ImageData) => {
   }
 
   return labs;
+};
+
+const computeLuminancePixels = (imageData: ImageData) => {
+  const totalPixels = imageData.width * imageData.height;
+  const luminance = new Float32Array(totalPixels);
+
+  for (let pixelIndex = 0; pixelIndex < totalPixels; pixelIndex += 1) {
+    const sourceIndex = pixelIndex * 4;
+    luminance[pixelIndex] =
+      imageData.data[sourceIndex] * 0.299 +
+      imageData.data[sourceIndex + 1] * 0.587 +
+      imageData.data[sourceIndex + 2] * 0.114;
+  }
+
+  return luminance;
+};
+
+export const analyzeSceneMap = (imageData: ImageData): SceneMap => {
+  const tileSize = clamp(
+    Math.round(Math.max(imageData.width, imageData.height) / 22),
+    8,
+    18
+  );
+  const cols = Math.ceil(imageData.width / tileSize);
+  const rows = Math.ceil(imageData.height / tileSize);
+  const scores = new Float32Array(cols * rows);
+  const luminance = computeLuminancePixels(imageData);
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < cols; column += 1) {
+      const startX = column * tileSize;
+      const startY = row * tileSize;
+      const endX = Math.min(imageData.width - 1, startX + tileSize);
+      const endY = Math.min(imageData.height - 1, startY + tileSize);
+      let edgeSum = 0;
+      let edgeCount = 0;
+      let axialEdges = 0;
+      let edgePixels = 0;
+
+      for (let y = Math.max(1, startY); y < endY; y += 1) {
+        for (let x = Math.max(1, startX); x < endX; x += 1) {
+          const pixelIndex = y * imageData.width + x;
+          const gx =
+            luminance[pixelIndex + 1] - luminance[pixelIndex - 1];
+          const gy =
+            luminance[pixelIndex + imageData.width] -
+            luminance[pixelIndex - imageData.width];
+          const absGx = Math.abs(gx);
+          const absGy = Math.abs(gy);
+          const edgeMagnitude = absGx + absGy;
+
+          edgeSum += edgeMagnitude;
+          edgeCount += 1;
+
+          if (edgeMagnitude > 18) {
+            edgePixels += 1;
+            const dominant = Math.max(absGx, absGy);
+            const secondary = Math.min(absGx, absGy);
+
+            if (dominant > secondary * 1.5) {
+              axialEdges += 1;
+            }
+          }
+        }
+      }
+
+      const averageEdge = edgeCount === 0 ? 0 : edgeSum / edgeCount;
+      const edgeStrength = clamp01((averageEdge - 6) / 42);
+      const axialRatio = edgePixels === 0 ? 0 : axialEdges / edgePixels;
+      const structuralScore = clamp01(edgeStrength * 0.45 + axialRatio * 0.75);
+
+      scores[row * cols + column] = structuralScore;
+    }
+  }
+
+  return {
+    cols,
+    rows,
+    tileSize,
+    scores
+  };
+};
+
+export const sampleSceneScore = (
+  sceneMap: SceneMap,
+  x: number,
+  y: number
+) => {
+  const gridX = clamp(x / sceneMap.tileSize - 0.5, 0, sceneMap.cols - 1);
+  const gridY = clamp(y / sceneMap.tileSize - 0.5, 0, sceneMap.rows - 1);
+  const x0 = Math.floor(gridX);
+  const y0 = Math.floor(gridY);
+  const x1 = Math.min(sceneMap.cols - 1, x0 + 1);
+  const y1 = Math.min(sceneMap.rows - 1, y0 + 1);
+  const tx = gridX - x0;
+  const ty = gridY - y0;
+  const index = (column: number, row: number) => row * sceneMap.cols + column;
+  const top =
+    sceneMap.scores[index(x0, y0)] * (1 - tx) +
+    sceneMap.scores[index(x1, y0)] * tx;
+  const bottom =
+    sceneMap.scores[index(x0, y1)] * (1 - tx) +
+    sceneMap.scores[index(x1, y1)] * tx;
+
+  return top * (1 - ty) + bottom * ty;
 };
 
 const chooseSampleIndices = (pixelCount: number, maxSamples: number) => {
@@ -426,21 +541,60 @@ export const mergeSmallRegions = (
   pixels: Uint8Array,
   width: number,
   height: number,
-  minRegionPixels: number
+  minRegionPixels: number,
+  sceneMap?: SceneMap,
+  cleanupStrength = 1
 ) => {
   const merged = new Uint8Array(pixels);
+
+  const getComponentSceneScore = (component: Component) => {
+    if (!sceneMap || component.pixels.length === 0) {
+      return 0;
+    }
+
+    const stride = Math.max(1, Math.floor(component.pixels.length / 24));
+    let total = 0;
+    let samples = 0;
+
+    for (let index = 0; index < component.pixels.length; index += stride) {
+      const pixelIndex = component.pixels[index];
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+      total += sampleSceneScore(sceneMap, x + 0.5, y + 0.5);
+      samples += 1;
+    }
+
+    return samples === 0 ? 0 : total / samples;
+  };
 
   const shouldMergeComponent = (component: Component) => {
     const regionWidth = component.maxX - component.minX + 1;
     const regionHeight = component.maxY - component.minY + 1;
     const shortSide = Math.min(regionWidth, regionHeight);
+    const longSide = Math.max(regionWidth, regionHeight);
     const fillRatio = component.pixelCount / (regionWidth * regionHeight);
+    const sceneScore = getComponentSceneScore(component);
+    const protection =
+      sceneScore * (0.5 + (1 - cleanupStrength) * 0.35);
+    const effectiveMinRegionPixels = Math.max(
+      2,
+      Math.round(minRegionPixels * (1 - protection))
+    );
+
+    if (
+      sceneScore > 0.52 &&
+      shortSide <= 2 &&
+      longSide >= 4 &&
+      component.pixelCount >= Math.max(3, Math.round(effectiveMinRegionPixels * 0.35))
+    ) {
+      return false;
+    }
 
     return (
-      component.pixelCount < minRegionPixels ||
-      (component.pixelCount < Math.round(minRegionPixels * 1.5) &&
+      component.pixelCount < effectiveMinRegionPixels ||
+      (component.pixelCount < Math.round(effectiveMinRegionPixels * 1.5) &&
         shortSide <= 2) ||
-      (component.pixelCount < Math.round(minRegionPixels * 1.3) &&
+      (component.pixelCount < Math.round(effectiveMinRegionPixels * 1.3) &&
         fillRatio < 0.4)
     );
   };
@@ -522,20 +676,40 @@ export const smoothPixelAssignments = (
   pixels: Uint8Array,
   width: number,
   height: number,
-  cleanupStrength: number
+  cleanupStrength: number,
+  sceneMap?: SceneMap
 ) => {
   if (cleanupStrength <= 0.08) {
     return new Uint8Array(pixels);
   }
 
   const smoothed = new Uint8Array(pixels);
-  const dominantThreshold = cleanupStrength >= 0.65 ? 5 : cleanupStrength >= 0.35 ? 6 : 7;
-  const marginThreshold = cleanupStrength >= 0.65 ? 3 : cleanupStrength >= 0.35 ? 4 : 5;
 
   for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
     const x = pixelIndex % width;
     const y = Math.floor(pixelIndex / width);
     const currentColor = pixels[pixelIndex];
+    const sceneScore = sceneMap
+      ? sampleSceneScore(sceneMap, x + 0.5, y + 0.5)
+      : 0;
+    const localCleanupStrength = cleanupStrength * (1 - sceneScore * 0.82);
+
+    if (localCleanupStrength <= 0.08) {
+      continue;
+    }
+
+    const dominantThreshold =
+      localCleanupStrength >= 0.65
+        ? 5
+        : localCleanupStrength >= 0.35
+          ? 6
+          : 7;
+    const marginThreshold =
+      localCleanupStrength >= 0.65
+        ? 3
+        : localCleanupStrength >= 0.35
+          ? 4
+          : 5;
     const neighborCounts = new Map<number, number>();
 
     for (const offset of smoothingOffsets) {
@@ -590,7 +764,8 @@ const collapsePixelBlocks = (
   pixels: Uint8Array,
   width: number,
   height: number,
-  blockSize: number
+  blockSize: number,
+  sceneMap?: SceneMap
 ) => {
   const collapsed = new Uint8Array(pixels);
 
@@ -615,8 +790,15 @@ const collapsePixelBlocks = (
       }
 
       const dominantColor = chooseDominantColor(colorCounts);
+      const blockSceneScore = sceneMap
+        ? sampleSceneScore(
+            sceneMap,
+            blockX + Math.min(blockSize, width - blockX) / 2,
+            blockY + Math.min(blockSize, height - blockY) / 2
+          )
+        : 0;
 
-      if (dominantColor === undefined) {
+      if (dominantColor === undefined || blockSceneScore > 0.46) {
         continue;
       }
 
@@ -645,7 +827,8 @@ const convergeRegionCount = (
   height: number,
   minRegionPixels: number,
   targetRegionCount: number,
-  cleanupStrength: number
+  cleanupStrength: number,
+  sceneMap?: SceneMap
 ) => {
   let merged = new Uint8Array(pixels);
   let mergeThreshold = minRegionPixels;
@@ -665,7 +848,14 @@ const convergeRegionCount = (
       mergeThreshold + 6,
       Math.round(mergeThreshold * thresholdMultiplier)
     );
-    merged = mergeSmallRegions(merged, width, height, mergeThreshold);
+    merged = mergeSmallRegions(
+      merged,
+      width,
+      height,
+      mergeThreshold,
+      sceneMap,
+      cleanupStrength
+    );
 
     const postMergeComponents = labelComponents(merged, width, height);
     const tinyComponentRatio =
@@ -677,9 +867,22 @@ const convergeRegionCount = (
       postMergeComponents.length > targetRegionCount * 2.5 &&
       tinyComponentRatio > 0.3
     ) {
-      merged = collapsePixelBlocks(merged, width, height, 2);
-      merged = smoothPixelAssignments(merged, width, height, cleanupStrength);
-      merged = mergeSmallRegions(merged, width, height, mergeThreshold);
+      merged = collapsePixelBlocks(merged, width, height, 2, sceneMap);
+      merged = smoothPixelAssignments(
+        merged,
+        width,
+        height,
+        cleanupStrength,
+        sceneMap
+      );
+      merged = mergeSmallRegions(
+        merged,
+        width,
+        height,
+        mergeThreshold,
+        sceneMap,
+        cleanupStrength
+      );
     }
   }
 
@@ -1019,18 +1222,22 @@ export const createPatternFromImageData = (
   }
 ): PatternDocument => {
   const options = { ...DEFAULT_PATTERN_OPTIONS, ...overrides };
+  const sceneMap = analyzeSceneMap(imageData);
   const quantized = quantizeImageData(imageData, options);
   const smoothed = smoothPixelAssignments(
     quantized.pixels,
     imageData.width,
     imageData.height,
-    options.cleanupStrength
+    options.cleanupStrength,
+    sceneMap
   );
   const pixels = mergeSmallRegions(
     smoothed,
     imageData.width,
     imageData.height,
-    options.minRegionPixels
+    options.minRegionPixels,
+    sceneMap,
+    options.cleanupStrength
   );
   const convergedPixels = convergeRegionCount(
     pixels,
@@ -1038,7 +1245,8 @@ export const createPatternFromImageData = (
     imageData.height,
     options.minRegionPixels,
     options.targetRegionCount,
-    options.cleanupStrength
+    options.cleanupStrength,
+    sceneMap
   );
   const components = labelComponents(
     convergedPixels,

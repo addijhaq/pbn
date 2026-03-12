@@ -2,9 +2,11 @@ import { Buffer } from 'node:buffer';
 import { PDFDocument } from 'pdf-lib';
 import { buildPdfBytes } from './pdf';
 import {
+  analyzeSceneMap,
   createPatternFromImageData,
   mergeSmallRegions,
   quantizeImageData,
+  sampleSceneScore,
   smoothPixelAssignments
 } from './pattern';
 import type { PatternDocument } from './types';
@@ -55,6 +57,26 @@ describe('quantizeImageData', () => {
 
     expect(quantized.palette).toHaveLength(8);
     expect(Math.max(...quantized.pixels)).toBeLessThan(8);
+  });
+});
+
+describe('analyzeSceneMap', () => {
+  it('scores line-heavy tiles as more structural than soft tiles', () => {
+    const imageData = createImageData(24, 12, (x) => {
+      if (x < 12) {
+        return Math.floor(x / 3) % 2 === 0
+          ? [20, 20, 20]
+          : [245, 245, 245];
+      }
+
+      return [190, 190, 190];
+    });
+
+    const sceneMap = analyzeSceneMap(imageData);
+    const structuralScore = sampleSceneScore(sceneMap, 4, 6);
+    const softScore = sampleSceneScore(sceneMap, 20, 6);
+
+    expect(structuralScore).toBeGreaterThan(softScore + 0.2);
   });
 });
 
