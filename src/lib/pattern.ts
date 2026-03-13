@@ -55,6 +55,16 @@ interface SceneMap {
   scores: Float32Array;
 }
 
+interface ImageProfile {
+  effectivePaletteSize: number;
+  cleanupStrengthScale: number;
+  minRegionScale: number;
+  targetRegionScale: number;
+  paletteMergeDistance: number;
+  flatArtworkScore: number;
+  monochromeScore: number;
+}
+
 const keyForPoint = (point: Point) => `${point.x},${point.y}`;
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
@@ -361,6 +371,113 @@ export const sampleSceneScore = (
   return top * (1 - ty) + bottom * ty;
 };
 
+export const analyzeImageProfile = (
+  imageData: ImageData,
+  requestedPaletteSize: number
+): ImageProfile => {
+  const totalPixels = imageData.width * imageData.height;
+  const sampleStride = Math.max(1, Math.round(Math.sqrt(totalPixels / 5200)));
+  const colorBins = new Set<number>();
+  let chromaSum = 0;
+  let sampleCount = 0;
+  let softTransitions = 0;
+  let mediumTransitions = 0;
+  let hardTransitions = 0;
+
+  for (let y = 0; y < imageData.height; y += sampleStride) {
+    for (let x = 0; x < imageData.width; x += sampleStride) {
+      const sourceIndex = (y * imageData.width + x) * 4;
+      const red = imageData.data[sourceIndex];
+      const green = imageData.data[sourceIndex + 1];
+      const blue = imageData.data[sourceIndex + 2];
+      const lab = rgbToLab(red, green, blue);
+      const chroma = Math.hypot(lab.a, lab.b);
+
+      colorBins.add(((red >> 4) << 8) | ((green >> 4) << 4) | (blue >> 4));
+      chromaSum += chroma;
+      sampleCount += 1;
+
+      if (x + sampleStride < imageData.width) {
+        const neighborIndex = (y * imageData.width + x + sampleStride) * 4;
+        const delta =
+          Math.abs(red - imageData.data[neighborIndex]) +
+          Math.abs(green - imageData.data[neighborIndex + 1]) +
+          Math.abs(blue - imageData.data[neighborIndex + 2]);
+
+        if (delta < 18) {
+          softTransitions += 1;
+        } else if (delta < 72) {
+          mediumTransitions += 1;
+        } else {
+          hardTransitions += 1;
+        }
+      }
+    }
+  }
+
+  const averageChroma = sampleCount === 0 ? 0 : chromaSum / sampleCount;
+  const transitionCount =
+    softTransitions + mediumTransitions + hardTransitions;
+  const softRatio =
+    transitionCount === 0 ? 1 : softTransitions / transitionCount;
+  const mediumRatio =
+    transitionCount === 0 ? 0 : mediumTransitions / transitionCount;
+  const hardRatio =
+    transitionCount === 0 ? 0 : hardTransitions / transitionCount;
+  const lowColorScore = clamp01(
+    (requestedPaletteSize + 4 - colorBins.size) /
+      Math.max(4, requestedPaletteSize + 2)
+  );
+  const monochromeScore = clamp01((18 - averageChroma) / 18);
+  const flatArtworkScore = clamp01(
+    lowColorScore * 0.58 +
+      softRatio * 0.16 +
+      hardRatio * 0.24 -
+      mediumRatio * 0.14
+  );
+
+  let effectivePaletteSize = requestedPaletteSize;
+
+  if (colorBins.size <= requestedPaletteSize + 2) {
+    effectivePaletteSize = Math.max(
+      2,
+      Math.min(requestedPaletteSize, colorBins.size)
+    );
+  } else if (monochromeScore > 0.72) {
+    effectivePaletteSize = Math.max(
+      2,
+      Math.min(
+        requestedPaletteSize,
+        4,
+        Math.max(2, Math.round(colorBins.size * 0.55))
+      )
+    );
+  } else if (flatArtworkScore > 0.45) {
+    effectivePaletteSize = Math.max(
+      3,
+      Math.min(
+        requestedPaletteSize,
+        Math.max(3, Math.round(Math.min(colorBins.size, requestedPaletteSize) * 0.82))
+      )
+    );
+  }
+
+  return {
+    effectivePaletteSize,
+    cleanupStrengthScale: clamp(
+      1 - flatArtworkScore * 0.42 - monochromeScore * 0.18,
+      0.48,
+      1
+    ),
+    minRegionScale: clamp(1 - flatArtworkScore * 0.15, 0.78, 1),
+    targetRegionScale: 1 + flatArtworkScore * 0.18 + monochromeScore * 0.08,
+    paletteMergeDistance:
+      monochromeScore > 0.72 ? 10 : flatArtworkScore > 0.55 ? 7 : 0,
+    flatArtworkScore,
+    monochromeScore
+  };
+};
+
 const chooseSampleIndices = (pixelCount: number, maxSamples: number) => {
   if (pixelCount <= maxSamples) {
     return Array.from({ length: pixelCount }, (_, index) => index);
@@ -567,6 +684,99 @@ export const quantizeImageData = (
     palette,
     pixels: assignments
   };
+};
+
+const compactPaletteToUsedColors = (
+  palette: PaletteEntry[],
+  pixels: Uint8Array
+) => {
+  const usageCounts = new Uint32Array(palette.length);
+
+  for (const paletteIndex of pixels) {
+    usageCounts[paletteIndex] += 1;
+  }
+
+  const usedIndices = palette
+    .map((_, index) => index)
+    .filter((index) => usageCounts[index] > 0);
+  const remap = new Uint8Array(palette.length);
+  const totalPixels = pixels.length;
+  const compactPalette = usedIndices.map((originalIndex, compactIndex) => {
+    remap[originalIndex] = compactIndex;
+    const entry = palette[originalIndex];
+
+    return {
+      ...entry,
+      index: compactIndex,
+      number: compactIndex + 1,
+      label: `Color ${compactIndex + 1}`,
+      usage: usageCounts[originalIndex] / totalPixels
+    };
+  });
+  const compactPixels = new Uint8Array(pixels.length);
+
+  for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
+    compactPixels[pixelIndex] = remap[pixels[pixelIndex]];
+  }
+
+  return {
+    palette: compactPalette,
+    pixels: compactPixels
+  };
+};
+
+const mergeSimilarPaletteEntries = (
+  palette: PaletteEntry[],
+  pixels: Uint8Array,
+  distanceThreshold: number
+) => {
+  if (palette.length === 0) {
+    return {
+      palette,
+      pixels
+    };
+  }
+
+  const compacted = compactPaletteToUsedColors(palette, pixels);
+
+  if (distanceThreshold <= 0 || compacted.palette.length <= 1) {
+    return compacted;
+  }
+
+  const labs = compacted.palette.map((entry) =>
+    rgbToLab(entry.rgb[0], entry.rgb[1], entry.rgb[2])
+  );
+  const remap = new Uint8Array(compacted.palette.length);
+
+  for (let index = 0; index < remap.length; index += 1) {
+    remap[index] = index;
+  }
+
+  for (let index = 1; index < compacted.palette.length; index += 1) {
+    let nearestMatch = -1;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (let candidate = 0; candidate < index; candidate += 1) {
+      const distance = labDistance(labs[index], labs[candidate]);
+
+      if (distance <= distanceThreshold && distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestMatch = remap[candidate];
+      }
+    }
+
+    if (nearestMatch !== -1) {
+      remap[index] = nearestMatch;
+    }
+  }
+
+  const mergedPixels = new Uint8Array(compacted.pixels.length);
+
+  for (let pixelIndex = 0; pixelIndex < compacted.pixels.length; pixelIndex += 1) {
+    mergedPixels[pixelIndex] = remap[compacted.pixels[pixelIndex]];
+  }
+
+  return compactPaletteToUsedColors(compacted.palette, mergedPixels);
 };
 
 const labelComponents = (
@@ -1332,34 +1542,55 @@ export const createPatternFromImageData = (
   }
 ): PatternDocument => {
   const options = { ...DEFAULT_PATTERN_OPTIONS, ...overrides };
+  const imageProfile = analyzeImageProfile(imageData, options.paletteSize);
+  const effectiveOptions = {
+    ...options,
+    paletteSize: imageProfile.effectivePaletteSize,
+    minRegionPixels: Math.max(
+      2,
+      Math.round(options.minRegionPixels * imageProfile.minRegionScale)
+    ),
+    targetRegionCount: Math.max(
+      24,
+      Math.round(options.targetRegionCount * imageProfile.targetRegionScale)
+    ),
+    cleanupStrength: clamp01(
+      options.cleanupStrength * imageProfile.cleanupStrengthScale
+    )
+  };
   const sceneMap = analyzeSceneMap(imageData);
-  const quantized = quantizeImageData(imageData, options);
+  const quantized = quantizeImageData(imageData, effectiveOptions);
   const smoothed = smoothPixelAssignments(
     quantized.pixels,
     imageData.width,
     imageData.height,
-    options.cleanupStrength,
+    effectiveOptions.cleanupStrength,
     sceneMap
   );
   const pixels = mergeSmallRegions(
     smoothed,
     imageData.width,
     imageData.height,
-    options.minRegionPixels,
+    effectiveOptions.minRegionPixels,
     sceneMap,
-    options.cleanupStrength
+    effectiveOptions.cleanupStrength
   );
   const convergedPixels = convergeRegionCount(
     pixels,
     imageData.width,
     imageData.height,
-    options.minRegionPixels,
-    options.targetRegionCount,
-    options.cleanupStrength,
+    effectiveOptions.minRegionPixels,
+    effectiveOptions.targetRegionCount,
+    effectiveOptions.cleanupStrength,
     sceneMap
   );
-  const components = labelComponents(
+  const normalized = mergeSimilarPaletteEntries(
+    quantized.palette,
     convergedPixels,
+    imageProfile.paletteMergeDistance
+  );
+  const components = labelComponents(
+    normalized.pixels,
     imageData.width,
     imageData.height
   );
@@ -1394,14 +1625,14 @@ export const createPatternFromImageData = (
     height: imageData.height,
     originalWidth: originalSize.width,
     originalHeight: originalSize.height,
-    palette: quantized.palette,
-    pixels: convergedPixels,
+    palette: normalized.palette,
+    pixels: normalized.pixels,
     regions,
     detailWindows: chooseDetailWindows(
       imageData.width,
       imageData.height,
       regions,
-      options
+      effectiveOptions
     )
   };
 };

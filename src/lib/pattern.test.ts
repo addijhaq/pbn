@@ -3,6 +3,7 @@ import { PDFDocument } from 'pdf-lib';
 import { buildPdfBytes } from './pdf';
 import {
   analyzeSceneMap,
+  analyzeImageProfile,
   buildPathString,
   createPatternFromImageData,
   mergeSmallRegions,
@@ -116,6 +117,19 @@ describe('analyzeSceneMap', () => {
   });
 });
 
+describe('analyzeImageProfile', () => {
+  it('detects monochrome artwork and reduces the effective palette size', () => {
+    const imageData = createImageData(18, 18, (x, y) =>
+      x < 9 || y < 9 ? [12, 12, 12] : [244, 244, 244]
+    );
+
+    const profile = analyzeImageProfile(imageData, 12);
+
+    expect(profile.monochromeScore).toBeGreaterThan(0.7);
+    expect(profile.effectivePaletteSize).toBeLessThanOrEqual(4);
+  });
+});
+
 describe('mergeSmallRegions', () => {
   it('absorbs isolated islands into neighboring regions', () => {
     const pixels = new Uint8Array([
@@ -181,6 +195,32 @@ describe('createPatternFromImageData', () => {
       expect(region.label.y).toBeGreaterThanOrEqual(region.bbox.y);
       expect(region.label.y).toBeLessThanOrEqual(region.bbox.y + region.bbox.height);
     }
+  });
+
+  it('keeps low-color artwork to the colors actually used in the final pattern', () => {
+    const imageData = createImageData(15, 15, (x, y) => {
+      if (x < 5) {
+        return [18, 18, 18];
+      }
+
+      if (y < 8) {
+        return [252, 252, 252];
+      }
+
+      return [214, 44, 58];
+    });
+
+    const pattern = createPatternFromImageData(imageData, {
+      paletteSize: 12,
+      minRegionPixels: 1,
+      targetRegionCount: 32,
+      cleanupStrength: 0.4
+    });
+    const paletteNumbers = [...new Set(pattern.regions.map((region) => region.paletteNumber))]
+      .sort((left, right) => left - right);
+
+    expect(pattern.palette).toHaveLength(3);
+    expect(paletteNumbers).toEqual([1, 2, 3]);
   });
 });
 
