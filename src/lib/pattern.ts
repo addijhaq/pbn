@@ -60,17 +60,127 @@ const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 const clamp01 = (value: number) => clamp(value, 0, 1);
 
+const formatPathNumber = (value: number) =>
+  `${Math.round(value * 1000) / 1000}`;
+
+const distanceBetweenPoints = (first: Point, second: Point) =>
+  Math.hypot(second.x - first.x, second.y - first.y);
+
+const triangleAreaTwice = (previous: Point, current: Point, next: Point) =>
+  Math.abs(
+    (current.x - previous.x) * (next.y - previous.y) -
+      (current.y - previous.y) * (next.x - previous.x)
+  );
+
+const movePointTowards = (
+  from: Point,
+  to: Point,
+  distance: number
+): Point => {
+  const length = distanceBetweenPoints(from, to);
+
+  if (length === 0 || distance === 0) {
+    return { ...from };
+  }
+
+  const ratio = distance / length;
+  return {
+    x: from.x + (to.x - from.x) * ratio,
+    y: from.y + (to.y - from.y) * ratio
+  };
+};
+
+export const simplifyContourLoop = (loop: Point[]) => {
+  if (loop.length < 6) {
+    return loop;
+  }
+
+  const simplified = [...loop];
+  let passesWithoutChange = 0;
+
+  while (simplified.length > 4 && passesWithoutChange < 2) {
+    let removedPoint = false;
+
+    for (let index = 0; index < simplified.length; index += 1) {
+      const previous =
+        simplified[(index - 1 + simplified.length) % simplified.length];
+      const current = simplified[index];
+      const next = simplified[(index + 1) % simplified.length];
+      const incomingLength = distanceBetweenPoints(previous, current);
+      const outgoingLength = distanceBetweenPoints(current, next);
+      const spanLength = distanceBetweenPoints(previous, next);
+      const areaTwice = triangleAreaTwice(previous, current, next);
+      const smallTurn =
+        areaTwice <= 1.25 &&
+        incomingLength <= 2.25 &&
+        outgoingLength <= 2.25;
+      const shortDogleg =
+        areaTwice <= 2.2 &&
+        incomingLength + outgoingLength <= 4.25 &&
+        spanLength <= 3.6;
+
+      if (smallTurn || shortDogleg) {
+        simplified.splice(index, 1);
+        removedPoint = true;
+        break;
+      }
+    }
+
+    if (removedPoint) {
+      passesWithoutChange = 0;
+    } else {
+      passesWithoutChange += 1;
+    }
+  }
+
+  return simplified.length >= 4 ? simplified : loop;
+};
+
+const buildRoundedLoopPath = (loop: Point[]) => {
+  if (loop.length < 3) {
+    return '';
+  }
+
+  const corners = loop.map((point, index) => {
+    const previous = loop[(index - 1 + loop.length) % loop.length];
+    const next = loop[(index + 1) % loop.length];
+    const incomingLength = distanceBetweenPoints(previous, point);
+    const outgoingLength = distanceBetweenPoints(point, next);
+    const radius = Math.min(0.42, incomingLength / 2, outgoingLength / 2);
+
+    return {
+      point,
+      entry: movePointTowards(point, previous, radius),
+      exit: movePointTowards(point, next, radius)
+    };
+  });
+
+  const firstCorner = corners[0];
+  const commands = [
+    `M${formatPathNumber(firstCorner.exit.x)} ${formatPathNumber(firstCorner.exit.y)}`
+  ];
+
+  for (let index = 1; index < corners.length; index += 1) {
+    const corner = corners[index];
+    commands.push(
+      `L${formatPathNumber(corner.entry.x)} ${formatPathNumber(corner.entry.y)}`,
+      `Q${formatPathNumber(corner.point.x)} ${formatPathNumber(corner.point.y)} ${formatPathNumber(corner.exit.x)} ${formatPathNumber(corner.exit.y)}`
+    );
+  }
+
+  commands.push(
+    `L${formatPathNumber(firstCorner.entry.x)} ${formatPathNumber(firstCorner.entry.y)}`,
+    `Q${formatPathNumber(firstCorner.point.x)} ${formatPathNumber(firstCorner.point.y)} ${formatPathNumber(firstCorner.exit.x)} ${formatPathNumber(firstCorner.exit.y)}`,
+    'Z'
+  );
+
+  return commands.join(' ');
+};
+
 export const buildPathString = (loops: Point[][]) =>
   loops
-    .map(
-      (loop) =>
-        loop
-          .map(
-            (point, index) =>
-              `${index === 0 ? 'M' : 'L'}${point.x} ${point.y}`
-          )
-          .join(' ') + ' Z'
-    )
+    .map((loop) => buildRoundedLoopPath(simplifyContourLoop(loop)))
+    .filter(Boolean)
     .join(' ');
 
 const clampDimension = (

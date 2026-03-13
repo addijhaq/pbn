@@ -6,8 +6,7 @@ import type {
   PatternDocument,
   PdfAssets,
   PdfExportOptions,
-  PatternRegion,
-  Point
+  PatternRegion
 } from './types';
 
 const pageSizes: Record<PageSize, { width: number; height: number }> = {
@@ -17,19 +16,6 @@ const pageSizes: Record<PageSize, { width: number; height: number }> = {
 
 const paperColor = rgb(0.992, 0.976, 0.949);
 const inkColor = rgb(0.118, 0.094, 0.078);
-
-const buildPdfPath = (loops: Point[][], documentHeight: number) =>
-  loops
-    .map(
-      (loop) =>
-        loop
-          .map((point, index) => {
-            const command = index === 0 ? 'M' : 'L';
-            return `${command}${point.x} ${documentHeight - point.y}`;
-          })
-          .join(' ') + ' Z'
-    )
-    .join(' ');
 
 const drawPageFrame = (
   page: PDFPage,
@@ -105,13 +91,15 @@ const drawVectorPattern = (
   const placement = fitIntoFrame(pattern.width, pattern.height, frame);
 
   for (const region of pattern.regions) {
-    if (!region.loops.length) {
+    if (!region.path) {
       continue;
     }
 
-    page.drawSvgPath(buildPdfPath(region.loops, pattern.height), {
+    page.drawSvgPath(region.path, {
       x: placement.x,
-      y: placement.y,
+      // drawSvgPath() flips the SVG Y axis internally, so its origin must be
+      // the top edge of the placed artwork, not the bottom edge.
+      y: placement.y + placement.height,
       scale: placement.scale,
       borderColor: inkColor,
       borderWidth: 0.55

@@ -3,10 +3,12 @@ import { PDFDocument } from 'pdf-lib';
 import { buildPdfBytes } from './pdf';
 import {
   analyzeSceneMap,
+  buildPathString,
   createPatternFromImageData,
   mergeSmallRegions,
   quantizeImageData,
   sampleSceneScore,
+  simplifyContourLoop,
   smoothPixelAssignments
 } from './pattern';
 import type { PatternDocument } from './types';
@@ -57,6 +59,40 @@ describe('quantizeImageData', () => {
 
     expect(quantized.palette).toHaveLength(8);
     expect(Math.max(...quantized.pixels)).toBeLessThan(8);
+  });
+});
+
+describe('buildPathString', () => {
+  it('rounds orthogonal corners with bezier curves', () => {
+    const path = buildPathString([[
+      { x: 0, y: 0 },
+      { x: 4, y: 0 },
+      { x: 4, y: 3 },
+      { x: 0, y: 3 }
+    ]]);
+
+    expect(path).toContain('Q');
+    expect(path.startsWith('M')).toBe(true);
+  });
+});
+
+describe('simplifyContourLoop', () => {
+  it('reduces staircase contours before bezier smoothing', () => {
+    const staircase = [
+      { x: 0, y: 0 },
+      { x: 4, y: 0 },
+      { x: 4, y: 1 },
+      { x: 5, y: 1 },
+      { x: 5, y: 2 },
+      { x: 6, y: 2 },
+      { x: 6, y: 5 },
+      { x: 0, y: 5 }
+    ];
+
+    const simplified = simplifyContourLoop(staircase);
+
+    expect(simplified.length).toBeLessThan(staircase.length);
+    expect(simplified.length).toBeGreaterThanOrEqual(4);
   });
 });
 
