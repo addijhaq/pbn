@@ -56,6 +56,7 @@ interface SceneMap {
 }
 
 interface ImageProfile {
+  renderingMode: 'photo' | 'artwork';
   effectivePaletteSize: number;
   cleanupStrengthScale: number;
   minRegionScale: number;
@@ -65,10 +66,63 @@ interface ImageProfile {
   monochromeScore: number;
 }
 
+interface QuantizationItem {
+  l: number;
+  a: number;
+  b: number;
+  weight: number;
+  detailScore: number;
+}
+
+interface ArtworkHueFamilyStats {
+  key: string;
+  itemIndices: number[];
+  totalWeight: number;
+  detailWeightedTotal: number;
+  priorityWeightedTotal: number;
+  minLightness: number;
+  maxLightness: number;
+  minChroma: number;
+  maxChroma: number;
+  meanChroma: number;
+}
+
+interface LineworkQuantizedResult {
+  palette: PaletteEntry[];
+  pixels: Uint8Array;
+  strokeMask?: Uint8Array;
+  strokePaletteIndex?: number;
+}
+
 const keyForPoint = (point: Point) => `${point.x},${point.y}`;
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 const clamp01 = (value: number) => clamp(value, 0, 1);
+
+const labChroma = (a: number, b: number) => Math.hypot(a, b);
+
+const labHueDegrees = (a: number, b: number) => {
+  const hue = (Math.atan2(b, a) * 180) / Math.PI;
+  return hue >= 0 ? hue : hue + 360;
+};
+
+const getArtworkHueFamilyKey = (l: number, a: number, b: number) => {
+  const chroma = labChroma(a, b);
+
+  if (chroma < 12) {
+    if (l < 30) {
+      return 'neutral-dark';
+    }
+
+    if (l < 68) {
+      return 'neutral-mid';
+    }
+
+    return 'neutral-light';
+  }
+
+  return `hue-${Math.floor(((labHueDegrees(a, b) + 30) % 360) / 60)}`;
+};
 
 const formatPathNumber = (value: number) =>
   `${Math.round(value * 1000) / 1000}`;
@@ -281,6 +335,36 @@ const computeLuminancePixels = (imageData: ImageData) => {
   return luminance;
 };
 
+const cloneImageData = (imageData: ImageData) =>
+  ({
+    data: new Uint8ClampedArray(imageData.data),
+    width: imageData.width,
+    height: imageData.height
+  }) as ImageData;
+
+const collectBorderPixelIndices = (
+  width: number,
+  height: number,
+  thickness: number
+) => {
+  const indices: number[] = [];
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (
+        x < thickness ||
+        y < thickness ||
+        x >= width - thickness ||
+        y >= height - thickness
+      ) {
+        indices.push(y * width + x);
+      }
+    }
+  }
+
+  return indices;
+};
+
 export const analyzeSceneMap = (imageData: ImageData): SceneMap => {
   const tileSize = clamp(
     Math.round(Math.max(imageData.width, imageData.height) / 22),
@@ -435,6 +519,12 @@ export const analyzeImageProfile = (
       hardRatio * 0.24 -
       mediumRatio * 0.14
   );
+  const renderingMode =
+    monochromeScore > 0.76 ||
+    flatArtworkScore > 0.42 ||
+    (flatArtworkScore > 0.3 && mediumRatio < 0.4 && hardRatio > 0.18)
+      ? 'artwork'
+      : 'photo';
 
   let effectivePaletteSize = requestedPaletteSize;
 
@@ -463,6 +553,7 @@ export const analyzeImageProfile = (
   }
 
   return {
+    renderingMode,
     effectivePaletteSize,
     cleanupStrengthScale: clamp(
       1 - flatArtworkScore * 0.42 - monochromeScore * 0.18,
@@ -478,6 +569,973 @@ export const analyzeImageProfile = (
   };
 };
 
+const buildQuantizationItems = (
+  labs: Float32Array,
+  sampleIndices: number[],
+  imageProfile?: ImageProfile,
+  detailProtectionMap?: Float32Array
+) => {
+  if (
+    !imageProfile ||
+    imageProfile.renderingMode !== 'artwork' ||
+    imageProfile.flatArtworkScore < 0.24
+  ) {
+    return sampleIndices.map((sampleIndex) => {
+      const offset = sampleIndex * 3;
+
+      return {
+        l: labs[offset],
+        a: labs[offset + 1],
+        b: labs[offset + 2],
+        weight: 1,
+        detailScore: detailProtectionMap?.[sampleIndex] ?? 0
+      };
+    });
+  }
+
+  const bins = new Map<
+    string,
+    { l: number; a: number; b: number; count: number; detailTotal: number }
+  >();
+
+  for (const sampleIndex of sampleIndices) {
+    const offset = sampleIndex * 3;
+    const lightness = labs[offset];
+    const greenRed = labs[offset + 1];
+    const blueYellow = labs[offset + 2];
+    const key = [
+      Math.round(lightness / 5),
+      Math.round((greenRed + 96) / 9),
+      Math.round((blueYellow + 96) / 9)
+    ].join(':');
+    const existing = bins.get(key);
+
+    if (existing) {
+      existing.l += lightness;
+      existing.a += greenRed;
+      existing.b += blueYellow;
+      existing.count += 1;
+      existing.detailTotal += detailProtectionMap?.[sampleIndex] ?? 0;
+      continue;
+    }
+
+    bins.set(key, {
+      l: lightness,
+      a: greenRed,
+      b: blueYellow,
+      count: 1,
+      detailTotal: detailProtectionMap?.[sampleIndex] ?? 0
+    });
+  }
+
+  const weightExponent = clamp(
+    0.56 + imageProfile.flatArtworkScore * 0.12,
+    0.54,
+    0.7
+  );
+
+  return Array.from(bins.values()).map((bin) => ({
+    l: bin.l / bin.count,
+    a: bin.a / bin.count,
+    b: bin.b / bin.count,
+    detailScore: bin.detailTotal / bin.count,
+    weight:
+      Math.max(1, bin.count ** weightExponent) *
+      (1 + (bin.detailTotal / bin.count) * 2.2)
+  }));
+};
+
+const scoreArtworkPriorityItem = (item: QuantizationItem, imageProfile: ImageProfile) => {
+  const chroma = labChroma(item.a, item.b);
+  const rarityScore = clamp01(1.9 / Math.sqrt(item.weight + 0.3));
+  const accentScore = clamp01((chroma - 10) / 30);
+
+  return (
+    item.detailScore * 0.62 +
+    accentScore * (0.22 + imageProfile.flatArtworkScore * 0.12) +
+    rarityScore * 0.18
+  );
+};
+
+const buildArtworkHueFamilyStats = (
+  items: QuantizationItem[],
+  imageProfile: ImageProfile
+) => {
+  const families = new Map<string, ArtworkHueFamilyStats>();
+
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    const item = items[itemIndex];
+    const chroma = labChroma(item.a, item.b);
+    const key = getArtworkHueFamilyKey(item.l, item.a, item.b);
+    const family = families.get(key);
+
+    if (family) {
+      family.itemIndices.push(itemIndex);
+      family.totalWeight += item.weight;
+      family.detailWeightedTotal += item.detailScore * item.weight;
+      family.priorityWeightedTotal +=
+        scoreArtworkPriorityItem(item, imageProfile) * item.weight;
+      family.minLightness = Math.min(family.minLightness, item.l);
+      family.maxLightness = Math.max(family.maxLightness, item.l);
+      family.minChroma = Math.min(family.minChroma, chroma);
+      family.maxChroma = Math.max(family.maxChroma, chroma);
+      family.meanChroma += chroma * item.weight;
+      continue;
+    }
+
+    families.set(key, {
+      key,
+      itemIndices: [itemIndex],
+      totalWeight: item.weight,
+      detailWeightedTotal: item.detailScore * item.weight,
+      priorityWeightedTotal: scoreArtworkPriorityItem(item, imageProfile) * item.weight,
+      minLightness: item.l,
+      maxLightness: item.l,
+      minChroma: chroma,
+      maxChroma: chroma,
+      meanChroma: chroma * item.weight
+    });
+  }
+
+  for (const family of families.values()) {
+    family.meanChroma /= family.totalWeight;
+  }
+
+  return families;
+};
+
+const artworkHueVariationScore = (family: ArtworkHueFamilyStats) =>
+  clamp01((family.maxLightness - family.minLightness - 4) / 16) * 0.48 +
+  clamp01((family.maxChroma - family.minChroma - 3) / 14) * 0.32 +
+  clamp01((family.itemIndices.length - 1) / 4) * 0.2;
+
+const chooseArtworkSplitFamily = (
+  items: QuantizationItem[],
+  imageProfile: ImageProfile
+) => {
+  const families = Array.from(
+    buildArtworkHueFamilyStats(items, imageProfile).values()
+  );
+  const totalWeight = families.reduce(
+    (sum, family) => sum + family.totalWeight,
+    0
+  );
+  let bestFamilyKey: string | null = null;
+  let bestScore = -1;
+
+  for (const family of families) {
+    if (family.key.startsWith('neutral-') || totalWeight <= 0) {
+      continue;
+    }
+
+    const weightRatio = family.totalWeight / totalWeight;
+    const variation = artworkHueVariationScore(family);
+    const meanPriority = family.priorityWeightedTotal / family.totalWeight;
+    const meanDetail = family.detailWeightedTotal / family.totalWeight;
+    const minorityBoost = clamp01((0.2 - weightRatio) / 0.12);
+    const presenceScore = clamp01((weightRatio - 0.045) / 0.14);
+    const chromaScore = clamp01((family.meanChroma - 12) / 24);
+    const splitScore =
+      variation * 0.34 +
+      minorityBoost * 0.24 +
+      meanPriority * 0.18 +
+      presenceScore * 0.14 +
+      meanDetail * 0.06 +
+      chromaScore * 0.04;
+
+    if (
+      variation < 0.24 ||
+      weightRatio < 0.045 ||
+      family.itemIndices.length < 2 ||
+      splitScore <= bestScore
+    ) {
+      continue;
+    }
+
+    bestFamilyKey = family.key;
+    bestScore = splitScore;
+  }
+
+  return bestFamilyKey;
+};
+
+const chooseArtworkFamilyRepresentative = (
+  items: QuantizationItem[],
+  familyKey: string,
+  selectedIndices: number[],
+  imageProfile: ImageProfile
+) => {
+  let bestIndex = -1;
+  let bestScore = -1;
+
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    if (selectedIndices.includes(itemIndex)) {
+      continue;
+    }
+
+    const item = items[itemIndex];
+
+    if (getArtworkHueFamilyKey(item.l, item.a, item.b) !== familyKey) {
+      continue;
+    }
+
+    const sameFamilySelections = selectedIndices.filter(
+      (selectedIndex) =>
+        getArtworkHueFamilyKey(
+          items[selectedIndex].l,
+          items[selectedIndex].a,
+          items[selectedIndex].b
+        ) === familyKey
+    );
+    const minDistance =
+      sameFamilySelections.length === 0
+        ? 14 ** 2
+        : sameFamilySelections.reduce((nearest, selectedIndex) => {
+            const selected = items[selectedIndex];
+            const distance = labDistance(
+              { l: item.l, a: item.a, b: item.b },
+              { l: selected.l, a: selected.a, b: selected.b }
+            );
+
+            return Math.min(nearest, distance);
+          }, Number.POSITIVE_INFINITY);
+    const separationScore = clamp01((Math.sqrt(minDistance) - 4.5) / 12);
+    const representativeScore =
+      scoreArtworkPriorityItem(item, imageProfile) * 0.62 +
+      separationScore * 0.3 +
+      clamp01((labChroma(item.a, item.b) - 12) / 28) * 0.08;
+
+    if (representativeScore > bestScore) {
+      bestScore = representativeScore;
+      bestIndex = itemIndex;
+    }
+  }
+
+  return bestIndex;
+};
+
+const chooseArtworkLineSeedItemIndex = (
+  items: QuantizationItem[],
+  dominantItemIndex: number,
+  imageProfile: ImageProfile
+) => {
+  const dominantItem = items[dominantItemIndex];
+  let bestIndex = -1;
+  let bestScore = 0;
+
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    if (itemIndex === dominantItemIndex) {
+      continue;
+    }
+
+    const item = items[itemIndex];
+    const lightnessGap = Math.abs(item.l - dominantItem.l);
+    const rarityScore = clamp01(1.8 / Math.sqrt(item.weight + 0.35));
+    const neutralityScore = 1 - clamp01((labChroma(item.a, item.b) - 14) / 26);
+    const separationScore = clamp01((lightnessGap - 12) / 26);
+    const lineSeedScore =
+      item.detailScore * 0.52 +
+      separationScore * 0.26 +
+      rarityScore * 0.14 +
+      neutralityScore * (0.04 + imageProfile.flatArtworkScore * 0.04);
+
+    if (
+      item.detailScore < 0.32 ||
+      lightnessGap < 12 ||
+      lineSeedScore <= bestScore
+    ) {
+      continue;
+    }
+
+    bestScore = lineSeedScore;
+    bestIndex = itemIndex;
+  }
+
+  return bestIndex;
+};
+
+const chooseArtworkSeedItemIndices = (
+  items: QuantizationItem[],
+  paletteSize: number,
+  imageProfile: ImageProfile,
+  dominantItemIndex?: number
+) => {
+  const reserveCount = Math.min(Math.max(2, Math.round(paletteSize * 0.4)), 4);
+  const ranked = items
+    .map((item, index) => ({
+      index,
+      score: scoreArtworkPriorityItem(item, imageProfile)
+    }))
+    .sort((left, right) => right.score - left.score);
+  const chosen: number[] = [];
+  const lineSeedIndex =
+    dominantItemIndex === undefined
+      ? -1
+      : chooseArtworkLineSeedItemIndex(items, dominantItemIndex, imageProfile);
+  const splitFamilyKey =
+    reserveCount >= 3 ? chooseArtworkSplitFamily(items, imageProfile) : null;
+
+  if (lineSeedIndex !== -1) {
+    chosen.push(lineSeedIndex);
+  }
+
+  if (splitFamilyKey) {
+    const representativeIndex = chooseArtworkFamilyRepresentative(
+      items,
+      splitFamilyKey,
+      chosen,
+      imageProfile
+    );
+
+    if (representativeIndex !== -1) {
+      chosen.push(representativeIndex);
+    }
+  }
+
+  for (const candidate of ranked) {
+    if (
+      splitFamilyKey &&
+      chosen.length >= reserveCount - 1
+    ) {
+      break;
+    }
+
+    const item = items[candidate.index];
+    const isDistinct = chosen.every((selectedIndex) => {
+      const selected = items[selectedIndex];
+      const distance = labDistance(
+        { l: item.l, a: item.a, b: item.b },
+        { l: selected.l, a: selected.a, b: selected.b }
+      );
+
+      return distance > 110 || item.detailScore > 0.42;
+    });
+
+    if (!isDistinct) {
+      continue;
+    }
+
+    chosen.push(candidate.index);
+
+    if (chosen.length >= reserveCount) {
+      break;
+    }
+  }
+
+  if (splitFamilyKey && chosen.length < reserveCount) {
+    const splitIndex = chooseArtworkFamilyRepresentative(
+      items,
+      splitFamilyKey,
+      chosen,
+      imageProfile
+    );
+
+    if (splitIndex !== -1) {
+      chosen.push(splitIndex);
+    }
+  }
+
+  if (chosen.length < reserveCount) {
+    for (const candidate of ranked) {
+      if (chosen.includes(candidate.index)) {
+        continue;
+      }
+
+      const item = items[candidate.index];
+      const isDistinct = chosen.every((selectedIndex) => {
+        const selected = items[selectedIndex];
+        const distance = labDistance(
+          { l: item.l, a: item.a, b: item.b },
+          { l: selected.l, a: selected.a, b: selected.b }
+        );
+
+        return distance > 110 || item.detailScore > 0.42;
+      });
+
+      if (!isDistinct) {
+        continue;
+      }
+
+      chosen.push(candidate.index);
+
+      if (chosen.length >= reserveCount) {
+        break;
+      }
+    }
+  }
+
+  return chosen;
+};
+
+const computeDetailProtectionMap = (
+  imageData: ImageData,
+  imageProfile: ImageProfile
+) => {
+  const scores = new Float32Array(imageData.width * imageData.height);
+
+  if (
+    imageProfile.flatArtworkScore < 0.16 &&
+    imageProfile.monochromeScore < 0.22
+  ) {
+    return scores;
+  }
+
+  const luminance = computeLuminancePixels(imageData);
+  const protectionScale = clamp(
+    0.25 +
+      imageProfile.flatArtworkScore * 0.55 +
+      imageProfile.monochromeScore * 0.3,
+    0.25,
+    1
+  );
+
+  for (let pixelIndex = 0; pixelIndex < scores.length; pixelIndex += 1) {
+    const x = pixelIndex % imageData.width;
+    const y = Math.floor(pixelIndex / imageData.width);
+    const sourceIndex = pixelIndex * 4;
+    const red = imageData.data[sourceIndex];
+    const green = imageData.data[sourceIndex + 1];
+    const blue = imageData.data[sourceIndex + 2];
+    const currentLuminance = luminance[pixelIndex];
+    let maxContrast = 0;
+    let neighborLuminanceSum = 0;
+    let neighborCount = 0;
+    let highContrastNeighbors = 0;
+    let lowContrastNeighbors = 0;
+
+    for (const offset of neighborOffsets) {
+      const nx = x + offset.dx;
+      const ny = y + offset.dy;
+
+      if (nx < 0 || nx >= imageData.width || ny < 0 || ny >= imageData.height) {
+        continue;
+      }
+
+      const neighborIndex = ny * imageData.width + nx;
+      const neighborSourceIndex = neighborIndex * 4;
+      const deltaLuminance = Math.abs(currentLuminance - luminance[neighborIndex]);
+      const deltaColor =
+        Math.abs(red - imageData.data[neighborSourceIndex]) +
+        Math.abs(green - imageData.data[neighborSourceIndex + 1]) +
+        Math.abs(blue - imageData.data[neighborSourceIndex + 2]);
+      const contrast = deltaLuminance + deltaColor * 0.14;
+
+      neighborLuminanceSum += luminance[neighborIndex];
+      neighborCount += 1;
+      maxContrast = Math.max(maxContrast, contrast);
+
+      if (contrast >= 44) {
+        highContrastNeighbors += 1;
+      } else if (contrast <= 16) {
+        lowContrastNeighbors += 1;
+      }
+    }
+
+    if (neighborCount === 0) {
+      continue;
+    }
+
+    const meanNeighborLuminance = neighborLuminanceSum / neighborCount;
+    const localEdgeScore = clamp01((maxContrast - 22) / 82);
+    const localExtremeness = clamp01(
+      (Math.abs(currentLuminance - meanNeighborLuminance) - 18) / 78
+    );
+    const thinLineBoost =
+      highContrastNeighbors >= 2 && lowContrastNeighbors <= 2 ? 0.28 : 0;
+
+    scores[pixelIndex] = clamp01(
+      (localEdgeScore * (0.52 + localExtremeness * 0.3 + thinLineBoost)) *
+        protectionScale
+    );
+  }
+
+  return scores;
+};
+
+const dilateMask = (
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  iterations = 1
+) => {
+  let current = new Uint8Array(mask);
+
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const next = new Uint8Array(current);
+
+    for (let pixelIndex = 0; pixelIndex < current.length; pixelIndex += 1) {
+      if (current[pixelIndex] === 0) {
+        continue;
+      }
+
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+
+      for (const offset of smoothingOffsets) {
+        const nx = x + offset.dx;
+        const ny = y + offset.dy;
+
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+          continue;
+        }
+
+        next[ny * width + nx] = 1;
+      }
+    }
+
+    current = next;
+  }
+
+  return current;
+};
+
+const averageLabFromPixelList = (labs: Float32Array, pixelIndices: number[]) => {
+  let totalL = 0;
+  let totalA = 0;
+  let totalB = 0;
+
+  for (const pixelIndex of pixelIndices) {
+    const offset = pixelIndex * 3;
+    totalL += labs[offset];
+    totalA += labs[offset + 1];
+    totalB += labs[offset + 2];
+  }
+
+  return {
+    l: totalL / pixelIndices.length,
+    a: totalA / pixelIndices.length,
+    b: totalB / pixelIndices.length
+  };
+};
+
+const buildLineworkStrokeMask = (
+  imageData: ImageData,
+  detailProtectionMap: Float32Array,
+  dilationIterations = 1
+) => {
+  const luminance = computeLuminancePixels(imageData);
+  const strokeMask = new Uint8Array(imageData.width * imageData.height);
+
+  for (let pixelIndex = 0; pixelIndex < strokeMask.length; pixelIndex += 1) {
+    const detailScore = detailProtectionMap[pixelIndex];
+    const x = pixelIndex % imageData.width;
+    const y = Math.floor(pixelIndex / imageData.width);
+    const currentLuminance = luminance[pixelIndex];
+    let neighborLuminanceTotal = 0;
+    let neighborCount = 0;
+    let strongContrastNeighbors = 0;
+    let similarNeighbors = 0;
+    let brighterNeighbors = 0;
+    let darkerNeighbors = 0;
+    let colorContrastNeighbors = 0;
+
+    if (detailScore < 0.28) {
+      continue;
+    }
+
+    for (const offset of smoothingOffsets) {
+      const nx = x + offset.dx;
+      const ny = y + offset.dy;
+
+      if (nx < 0 || nx >= imageData.width || ny < 0 || ny >= imageData.height) {
+        continue;
+      }
+
+      const neighborIndex = ny * imageData.width + nx;
+      const delta = currentLuminance - luminance[neighborIndex];
+      const absDelta = Math.abs(delta);
+      const sourceIndex = pixelIndex * 4;
+      const neighborSourceIndex = neighborIndex * 4;
+      const colorDelta =
+        Math.abs(imageData.data[sourceIndex] - imageData.data[neighborSourceIndex]) +
+        Math.abs(
+          imageData.data[sourceIndex + 1] - imageData.data[neighborSourceIndex + 1]
+        ) +
+        Math.abs(
+          imageData.data[sourceIndex + 2] - imageData.data[neighborSourceIndex + 2]
+        );
+
+      neighborLuminanceTotal += luminance[neighborIndex];
+      neighborCount += 1;
+
+      if (absDelta >= 22) {
+        strongContrastNeighbors += 1;
+      } else if (absDelta <= 9) {
+        similarNeighbors += 1;
+      }
+
+      if (colorDelta >= 52) {
+        colorContrastNeighbors += 1;
+      }
+
+      if (delta >= 16) {
+        brighterNeighbors += 1;
+      } else if (delta <= -16) {
+        darkerNeighbors += 1;
+      }
+    }
+
+    if (neighborCount === 0) {
+      continue;
+    }
+
+    const meanNeighborLuminance = neighborLuminanceTotal / neighborCount;
+    const localLuminanceDelta = currentLuminance - meanNeighborLuminance;
+    const likelyBrightStroke =
+      localLuminanceDelta >= 12 &&
+      brighterNeighbors >= 2 &&
+      (strongContrastNeighbors >= 2 || colorContrastNeighbors >= 2) &&
+      (similarNeighbors >= 1 || detailScore >= 0.5);
+    const likelyDarkStroke =
+      localLuminanceDelta <= -14 &&
+      darkerNeighbors >= 2 &&
+      (strongContrastNeighbors >= 2 || colorContrastNeighbors >= 2) &&
+      (similarNeighbors >= 1 || detailScore >= 0.5);
+    const likelyEdgeStroke =
+      Math.abs(localLuminanceDelta) >= 10 &&
+      strongContrastNeighbors + colorContrastNeighbors >= 3 &&
+      similarNeighbors <= 4 &&
+      ((localLuminanceDelta >= 0 && brighterNeighbors >= 1) ||
+        (localLuminanceDelta < 0 && darkerNeighbors >= 1));
+
+    if (
+      (detailScore >= 0.36 &&
+        (likelyBrightStroke || likelyDarkStroke) &&
+        strongContrastNeighbors + colorContrastNeighbors <= 9) ||
+      (detailScore >= 0.22 && likelyEdgeStroke) ||
+      (detailScore >= 0.58 &&
+        Math.abs(localLuminanceDelta) >= 14 &&
+        strongContrastNeighbors + colorContrastNeighbors >= 2)
+    ) {
+      strokeMask[pixelIndex] = 1;
+    }
+  }
+
+  return dilationIterations > 0
+    ? dilateMask(strokeMask, imageData.width, imageData.height, dilationIterations)
+    : strokeMask;
+};
+
+const strengthenArtworkLineProtection = (
+  imageData: ImageData,
+  imageProfile: ImageProfile,
+  detailProtectionMap: Float32Array
+) => {
+  if (imageProfile.renderingMode !== 'artwork') {
+    return detailProtectionMap;
+  }
+
+  const coreStrokeMask = buildLineworkStrokeMask(
+    imageData,
+    detailProtectionMap,
+    0
+  );
+  let strokePixelCount = 0;
+
+  for (const pixel of coreStrokeMask) {
+    if (pixel === 1) {
+      strokePixelCount += 1;
+    }
+  }
+
+  if (strokePixelCount < Math.max(10, Math.round(coreStrokeMask.length * 0.006))) {
+    return detailProtectionMap;
+  }
+
+  const strengthened = new Float32Array(detailProtectionMap);
+
+  for (let pixelIndex = 0; pixelIndex < strengthened.length; pixelIndex += 1) {
+    if (coreStrokeMask[pixelIndex] === 1) {
+      strengthened[pixelIndex] = Math.max(strengthened[pixelIndex], 0.94);
+      continue;
+    }
+
+    if (strengthened[pixelIndex] < 0.28) {
+      continue;
+    }
+
+    const x = pixelIndex % imageData.width;
+    const y = Math.floor(pixelIndex / imageData.width);
+    let adjacentStrokeCount = 0;
+
+    for (const offset of neighborOffsets) {
+      const nx = x + offset.dx;
+      const ny = y + offset.dy;
+
+      if (nx < 0 || nx >= imageData.width || ny < 0 || ny >= imageData.height) {
+        continue;
+      }
+
+      if (coreStrokeMask[ny * imageData.width + nx] === 1) {
+        adjacentStrokeCount += 1;
+      }
+    }
+
+    if (adjacentStrokeCount >= 2) {
+      strengthened[pixelIndex] = Math.max(strengthened[pixelIndex], 0.68);
+    }
+  }
+
+  return strengthened;
+};
+
+const normalizeArtworkBackground = (
+  imageData: ImageData,
+  imageProfile: ImageProfile,
+  detailProtectionMap: Float32Array
+) => {
+  if (
+    imageProfile.renderingMode !== 'artwork' ||
+    imageProfile.flatArtworkScore < 0.28
+  ) {
+    return imageData;
+  }
+
+  const width = imageData.width;
+  const height = imageData.height;
+  const totalPixels = width * height;
+  const labs = computeLabPixels(imageData);
+  const borderThickness = clamp(Math.round(Math.min(width, height) / 18), 1, 4);
+  const borderIndices = collectBorderPixelIndices(width, height, borderThickness);
+  const borderBins = new Map<
+    string,
+    { count: number; l: number; a: number; b: number; samples: number }
+  >();
+  let eligibleBorderPixels = 0;
+
+  for (const pixelIndex of borderIndices) {
+    if (detailProtectionMap[pixelIndex] > 0.34) {
+      continue;
+    }
+
+    const offset = pixelIndex * 3;
+    const key = [
+      Math.round(labs[offset] / 6),
+      Math.round((labs[offset + 1] + 110) / 12),
+      Math.round((labs[offset + 2] + 110) / 12)
+    ].join(':');
+    const existing = borderBins.get(key);
+
+    if (existing) {
+      existing.count += 1;
+      existing.l += labs[offset];
+      existing.a += labs[offset + 1];
+      existing.b += labs[offset + 2];
+      existing.samples += 1;
+    } else {
+      borderBins.set(key, {
+        count: 1,
+        l: labs[offset],
+        a: labs[offset + 1],
+        b: labs[offset + 2],
+        samples: 1
+      });
+    }
+
+    eligibleBorderPixels += 1;
+  }
+
+  if (eligibleBorderPixels === 0 || borderBins.size === 0) {
+    return imageData;
+  }
+
+  const dominantBin = Array.from(borderBins.entries()).sort(
+    (left, right) => right[1].count - left[1].count
+  )[0];
+
+  if (!dominantBin || dominantBin[1].count / eligibleBorderPixels < 0.44) {
+    return imageData;
+  }
+
+  const isLineworkArtwork =
+    imageProfile.monochromeScore > 0.52 &&
+    imageProfile.flatArtworkScore > 0.28;
+  const dominantLab = {
+    l: dominantBin[1].l / dominantBin[1].samples,
+    a: dominantBin[1].a / dominantBin[1].samples,
+    b: dominantBin[1].b / dominantBin[1].samples
+  };
+  const distanceThreshold =
+    imageProfile.monochromeScore > 0.6
+      ? isLineworkArtwork
+        ? 38 ** 2
+        : 30 ** 2
+      : 26 ** 2;
+  const strokeMask = isLineworkArtwork
+    ? buildLineworkStrokeMask(imageData, detailProtectionMap)
+    : new Uint8Array(totalPixels);
+  const visited = new Uint8Array(totalPixels);
+  const queue: number[] = [];
+  let head = 0;
+
+  for (const pixelIndex of borderIndices) {
+    if (visited[pixelIndex] || strokeMask[pixelIndex] === 1) {
+      continue;
+    }
+
+    const offset = pixelIndex * 3;
+    const distance = labDistance(dominantLab, {
+      l: labs[offset],
+      a: labs[offset + 1],
+      b: labs[offset + 2]
+    });
+
+    if (
+      detailProtectionMap[pixelIndex] <= 0.34 &&
+      distance <= distanceThreshold
+    ) {
+      visited[pixelIndex] = 1;
+      queue.push(pixelIndex);
+    }
+  }
+
+  while (head < queue.length) {
+    const pixelIndex = queue[head];
+    head += 1;
+    const x = pixelIndex % width;
+    const y = Math.floor(pixelIndex / width);
+
+    for (const offset of neighborOffsets) {
+      const nx = x + offset.dx;
+      const ny = y + offset.dy;
+
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+        continue;
+      }
+
+      const neighborIndex = ny * width + nx;
+
+      if (
+        visited[neighborIndex] ||
+        strokeMask[neighborIndex] === 1 ||
+        detailProtectionMap[neighborIndex] >
+          (isLineworkArtwork ? 0.56 : 0.38)
+      ) {
+        continue;
+      }
+
+      const neighborOffset = neighborIndex * 3;
+      const distance = labDistance(dominantLab, {
+        l: labs[neighborOffset],
+        a: labs[neighborOffset + 1],
+        b: labs[neighborOffset + 2]
+      });
+
+      if (distance > distanceThreshold) {
+        continue;
+      }
+
+      visited[neighborIndex] = 1;
+      queue.push(neighborIndex);
+    }
+  }
+
+  const backgroundPixels = queue.length;
+  const backgroundCoverage = backgroundPixels / totalPixels;
+  let borderHitCount = 0;
+
+  for (const pixelIndex of borderIndices) {
+    if (visited[pixelIndex] === 1) {
+      borderHitCount += 1;
+    }
+  }
+
+  const borderCoverage = borderHitCount / borderIndices.length;
+
+  if (backgroundCoverage < 0.18 || borderCoverage < 0.52) {
+    return imageData;
+  }
+
+  const normalized = cloneImageData(imageData);
+  const normalizedLab = averageLabFromPixelList(labs, queue);
+  const normalizedRgb = labToRgb(normalizedLab.l, normalizedLab.a, normalizedLab.b);
+
+  for (const pixelIndex of queue) {
+    const sourceIndex = pixelIndex * 4;
+    normalized.data[sourceIndex] = normalizedRgb[0];
+    normalized.data[sourceIndex + 1] = normalizedRgb[1];
+    normalized.data[sourceIndex + 2] = normalizedRgb[2];
+  }
+
+  if (!isLineworkArtwork) {
+    return normalized;
+  }
+
+  const strokePixels: number[] = [];
+  const fillPixels: number[] = [];
+
+  for (let pixelIndex = 0; pixelIndex < totalPixels; pixelIndex += 1) {
+    if (visited[pixelIndex] === 1) {
+      continue;
+    }
+
+    if (strokeMask[pixelIndex] === 1) {
+      strokePixels.push(pixelIndex);
+    } else {
+      fillPixels.push(pixelIndex);
+    }
+  }
+
+  if (strokePixels.length === 0 || fillPixels.length === 0) {
+    return normalized;
+  }
+
+  const strokeLab = averageLabFromPixelList(labs, strokePixels);
+  const fillLab = averageLabFromPixelList(labs, fillPixels);
+  const separationNeedsLift =
+    labDistance(normalizedLab, fillLab) < 18 ** 2;
+  const fillTargetLab = {
+    l: clamp(
+      fillLab.l + (separationNeedsLift ? (normalizedLab.l < 55 ? 9 : -9) : 0),
+      0,
+      100
+    ),
+    a: fillLab.a,
+    b: fillLab.b
+  };
+  const strokeTargetLab =
+    normalizedLab.l < 55
+      ? {
+          l: clamp(Math.max(strokeLab.l, normalizedLab.l + 34, 84), 0, 100),
+          a: strokeLab.a,
+          b: strokeLab.b
+        }
+      : {
+          l: clamp(Math.min(strokeLab.l, normalizedLab.l - 28, 18), 0, 100),
+          a: strokeLab.a,
+          b: strokeLab.b
+        };
+  const strokeRgb = labToRgb(
+    strokeTargetLab.l,
+    strokeTargetLab.a,
+    strokeTargetLab.b
+  );
+
+  for (const pixelIndex of strokePixels) {
+    const sourceIndex = pixelIndex * 4;
+    normalized.data[sourceIndex] = strokeRgb[0];
+    normalized.data[sourceIndex + 1] = strokeRgb[1];
+    normalized.data[sourceIndex + 2] = strokeRgb[2];
+  }
+
+  for (const pixelIndex of fillPixels) {
+    const offset = pixelIndex * 3;
+    const blend = clamp(0.72 - detailProtectionMap[pixelIndex] * 0.35, 0.42, 0.78);
+    const blendedLab = {
+      l: labs[offset] * (1 - blend) + fillTargetLab.l * blend,
+      a: labs[offset + 1] * (1 - blend) + fillTargetLab.a * blend,
+      b: labs[offset + 2] * (1 - blend) + fillTargetLab.b * blend
+    };
+    const rgb = labToRgb(blendedLab.l, blendedLab.a, blendedLab.b);
+    const sourceIndex = pixelIndex * 4;
+    normalized.data[sourceIndex] = rgb[0];
+    normalized.data[sourceIndex + 1] = rgb[1];
+    normalized.data[sourceIndex + 2] = rgb[2];
+  }
+
+  return normalized;
+};
+
 const chooseSampleIndices = (pixelCount: number, maxSamples: number) => {
   if (pixelCount <= maxSamples) {
     return Array.from({ length: pixelCount }, (_, index) => index);
@@ -490,20 +1548,25 @@ const chooseSampleIndices = (pixelCount: number, maxSamples: number) => {
 };
 
 const farthestSampleIndex = (
-  sampleIndices: number[],
-  labs: Float32Array,
+  items: QuantizationItem[],
   centroids: Float32Array,
-  centroidCount: number
+  centroidCount: number,
+  imageProfile?: ImageProfile,
+  excludedIndices?: Set<number>
 ) => {
-  let bestIndex = sampleIndices[0] ?? 0;
+  let bestIndex = 0;
   let bestDistance = -1;
 
-  for (const sampleIndex of sampleIndices) {
-    const offset = sampleIndex * 3;
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    if (excludedIndices?.has(itemIndex)) {
+      continue;
+    }
+
+    const item = items[itemIndex];
     const lab = {
-      l: labs[offset],
-      a: labs[offset + 1],
-      b: labs[offset + 2]
+      l: item.l,
+      a: item.a,
+      b: item.b
     };
     let nearest = Number.POSITIVE_INFINITY;
 
@@ -517,9 +1580,22 @@ const farthestSampleIndex = (
       nearest = Math.min(nearest, labDistance(lab, centroid));
     }
 
-    if (nearest > bestDistance) {
-      bestDistance = nearest;
-      bestIndex = sampleIndex;
+    const chroma = Math.hypot(item.a, item.b);
+    const rarityBoost = imageProfile
+      ? 1 +
+        imageProfile.flatArtworkScore *
+          clamp01(1.8 / Math.sqrt(item.weight + 0.35)) *
+          0.14
+      : 1;
+    const accentBoost = imageProfile
+      ? 1 +
+        imageProfile.flatArtworkScore * clamp01((chroma - 12) / 34) * 0.22
+      : 1;
+    const score = nearest * rarityBoost * accentBoost;
+
+    if (score > bestDistance) {
+      bestDistance = score;
+      bestIndex = itemIndex;
     }
   }
 
@@ -528,7 +1604,9 @@ const farthestSampleIndex = (
 
 export const quantizeImageData = (
   imageData: ImageData,
-  options: PatternOptions
+  options: PatternOptions,
+  imageProfile?: ImageProfile,
+  detailProtectionMap?: Float32Array
 ): {
   palette: PaletteEntry[];
   pixels: Uint8Array;
@@ -539,76 +1617,120 @@ export const quantizeImageData = (
     pixelCount,
     Math.max(9000, options.paletteSize * 450)
   );
-  const centroidCount = options.paletteSize;
+  const items = buildQuantizationItems(
+    labs,
+    sampleIndices,
+    imageProfile,
+    detailProtectionMap
+  );
+  const centroidCount = Math.max(1, Math.min(options.paletteSize, items.length));
   const centroids = new Float32Array(centroidCount * 3);
+  const useDirectArtworkBins =
+    imageProfile?.renderingMode === 'artwork' &&
+    imageProfile.flatArtworkScore > 0.26 &&
+    items.length <= centroidCount;
 
-  if (sampleIndices.length === 0) {
+  if (items.length === 0) {
     throw new Error('The uploaded image does not contain any pixels.');
   }
 
-  const firstSampleOffset = sampleIndices[0] * 3;
-  centroids[0] = labs[firstSampleOffset];
-  centroids[1] = labs[firstSampleOffset + 1];
-  centroids[2] = labs[firstSampleOffset + 2];
-
-  for (let centroidIndex = 1; centroidIndex < centroidCount; centroidIndex += 1) {
-    const sampleIndex = farthestSampleIndex(
-      sampleIndices,
-      labs,
-      centroids,
-      centroidIndex
+  if (useDirectArtworkBins) {
+    for (let centroidIndex = 0; centroidIndex < centroidCount; centroidIndex += 1) {
+      const centroidOffset = centroidIndex * 3;
+      centroids[centroidOffset] = items[centroidIndex].l;
+      centroids[centroidOffset + 1] = items[centroidIndex].a;
+      centroids[centroidOffset + 2] = items[centroidIndex].b;
+    }
+  } else {
+    const dominantItemIndex = items.reduce(
+      (bestIndex, item, index) =>
+        item.weight > items[bestIndex].weight ? index : bestIndex,
+      0
     );
-    const sourceOffset = sampleIndex * 3;
-    const centroidOffset = centroidIndex * 3;
-    centroids[centroidOffset] = labs[sourceOffset];
-    centroids[centroidOffset + 1] = labs[sourceOffset + 1];
-    centroids[centroidOffset + 2] = labs[sourceOffset + 2];
-  }
+    const seedIndices = [dominantItemIndex];
 
-  for (let iteration = 0; iteration < options.maxKMeansIterations; iteration += 1) {
-    const sums = new Float32Array(centroidCount * 3);
-    const counts = new Uint32Array(centroidCount);
+    if (imageProfile?.renderingMode === 'artwork') {
+      for (const itemIndex of chooseArtworkSeedItemIndices(
+        items,
+        centroidCount,
+        imageProfile,
+        dominantItemIndex
+      )) {
+        if (!seedIndices.includes(itemIndex)) {
+          seedIndices.push(itemIndex);
+        }
+      }
+    }
 
-    for (const sampleIndex of sampleIndices) {
-      const offset = sampleIndex * 3;
-      let nearestCentroid = 0;
-      let nearestDistance = Number.POSITIVE_INFINITY;
+    const usedSeedIndices = new Set<number>();
+
+    for (let centroidIndex = 0; centroidIndex < Math.min(centroidCount, seedIndices.length); centroidIndex += 1) {
+      const itemIndex = seedIndices[centroidIndex];
+      const centroidOffset = centroidIndex * 3;
+      centroids[centroidOffset] = items[itemIndex].l;
+      centroids[centroidOffset + 1] = items[itemIndex].a;
+      centroids[centroidOffset + 2] = items[itemIndex].b;
+      usedSeedIndices.add(itemIndex);
+    }
+
+    for (let centroidIndex = usedSeedIndices.size; centroidIndex < centroidCount; centroidIndex += 1) {
+      const itemIndex = farthestSampleIndex(
+        items,
+        centroids,
+        centroidIndex,
+        imageProfile,
+        usedSeedIndices
+      );
+      const centroidOffset = centroidIndex * 3;
+      centroids[centroidOffset] = items[itemIndex].l;
+      centroids[centroidOffset + 1] = items[itemIndex].a;
+      centroids[centroidOffset + 2] = items[itemIndex].b;
+      usedSeedIndices.add(itemIndex);
+    }
+
+    for (let iteration = 0; iteration < options.maxKMeansIterations; iteration += 1) {
+      const sums = new Float32Array(centroidCount * 3);
+      const counts = new Float32Array(centroidCount);
+
+      for (const item of items) {
+        let nearestCentroid = 0;
+        let nearestDistance = Number.POSITIVE_INFINITY;
+
+        for (let centroidIndex = 0; centroidIndex < centroidCount; centroidIndex += 1) {
+          const centroidOffset = centroidIndex * 3;
+          const distance =
+            (item.l - centroids[centroidOffset]) ** 2 +
+            (item.a - centroids[centroidOffset + 1]) ** 2 +
+            (item.b - centroids[centroidOffset + 2]) ** 2;
+
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestCentroid = centroidIndex;
+          }
+        }
+
+        const sumOffset = nearestCentroid * 3;
+        sums[sumOffset] += item.l * item.weight;
+        sums[sumOffset + 1] += item.a * item.weight;
+        sums[sumOffset + 2] += item.b * item.weight;
+        counts[nearestCentroid] += item.weight;
+      }
 
       for (let centroidIndex = 0; centroidIndex < centroidCount; centroidIndex += 1) {
         const centroidOffset = centroidIndex * 3;
-        const distance =
-          (labs[offset] - centroids[centroidOffset]) ** 2 +
-          (labs[offset + 1] - centroids[centroidOffset + 1]) ** 2 +
-          (labs[offset + 2] - centroids[centroidOffset + 2]) ** 2;
 
-        if (distance < nearestDistance) {
-          nearestDistance = distance;
-          nearestCentroid = centroidIndex;
+        if (counts[centroidIndex] === 0) {
+          const replacementItem = items[(centroidIndex * 487) % items.length];
+          centroids[centroidOffset] = replacementItem.l;
+          centroids[centroidOffset + 1] = replacementItem.a;
+          centroids[centroidOffset + 2] = replacementItem.b;
+          continue;
         }
+
+        centroids[centroidOffset] = sums[centroidOffset] / counts[centroidIndex];
+        centroids[centroidOffset + 1] = sums[centroidOffset + 1] / counts[centroidIndex];
+        centroids[centroidOffset + 2] = sums[centroidOffset + 2] / counts[centroidIndex];
       }
-
-      const sumOffset = nearestCentroid * 3;
-      sums[sumOffset] += labs[offset];
-      sums[sumOffset + 1] += labs[offset + 1];
-      sums[sumOffset + 2] += labs[offset + 2];
-      counts[nearestCentroid] += 1;
-    }
-
-    for (let centroidIndex = 0; centroidIndex < centroidCount; centroidIndex += 1) {
-      const centroidOffset = centroidIndex * 3;
-
-      if (counts[centroidIndex] === 0) {
-        const replacementIndex = sampleIndices[(centroidIndex * 487) % sampleIndices.length];
-        const sourceOffset = replacementIndex * 3;
-        centroids[centroidOffset] = labs[sourceOffset];
-        centroids[centroidOffset + 1] = labs[sourceOffset + 1];
-        centroids[centroidOffset + 2] = labs[sourceOffset + 2];
-        continue;
-      }
-
-      centroids[centroidOffset] = sums[centroidOffset] / counts[centroidIndex];
-      centroids[centroidOffset + 1] = sums[centroidOffset + 1] / counts[centroidIndex];
-      centroids[centroidOffset + 2] = sums[centroidOffset + 2] / counts[centroidIndex];
     }
   }
 
@@ -684,6 +1806,243 @@ export const quantizeImageData = (
     palette,
     pixels: assignments
   };
+};
+
+const reserveLineworkStrokePaletteSlot = (
+  imageData: ImageData,
+  quantized: {
+    palette: PaletteEntry[];
+    pixels: Uint8Array;
+  },
+  imageProfile: ImageProfile,
+  detailProtectionMap: Float32Array
+): LineworkQuantizedResult => {
+  const isLineworkArtwork = imageProfile.renderingMode === 'artwork';
+
+  if (!isLineworkArtwork || quantized.palette.length < 2) {
+    return quantized;
+  }
+
+  const strokeMask = buildLineworkStrokeMask(imageData, detailProtectionMap, 0);
+  const strokePixels: number[] = [];
+  const nonStrokePixels: number[] = [];
+
+  for (let pixelIndex = 0; pixelIndex < strokeMask.length; pixelIndex += 1) {
+    if (strokeMask[pixelIndex] === 1) {
+      strokePixels.push(pixelIndex);
+    } else {
+      nonStrokePixels.push(pixelIndex);
+    }
+  }
+
+  if (
+    strokePixels.length < Math.max(10, Math.round(strokeMask.length * 0.006)) ||
+    nonStrokePixels.length === 0
+  ) {
+    return quantized;
+  }
+
+  const labs = computeLabPixels(imageData);
+  const strokeLab = averageLabFromPixelList(labs, strokePixels);
+  const surroundingLab = averageLabFromPixelList(labs, nonStrokePixels);
+  const adjustedStrokeLab =
+    strokeLab.l >= surroundingLab.l
+      ? {
+          ...strokeLab,
+          l: clamp(
+            Math.max(strokeLab.l + 10, surroundingLab.l + 20, 86),
+            0,
+            100
+          )
+        }
+      : {
+          ...strokeLab,
+          l: clamp(
+            Math.min(strokeLab.l - 10, surroundingLab.l - 20, 18),
+            0,
+            100
+          )
+        };
+  const strokeRgb = labToRgb(
+    adjustedStrokeLab.l,
+    adjustedStrokeLab.a,
+    adjustedStrokeLab.b
+  );
+  const paletteLabs = quantized.palette.map((entry) =>
+    rgbToLab(entry.rgb[0], entry.rgb[1], entry.rgb[2])
+  );
+  const strokePaletteIndex = quantized.palette.reduce((bestIndex, entry, index) => {
+    const bestEntry = quantized.palette[bestIndex];
+
+    if (adjustedStrokeLab.l >= surroundingLab.l) {
+      return entry.lightness > bestEntry.lightness ? index : bestIndex;
+    }
+
+    return entry.lightness < bestEntry.lightness ? index : bestIndex;
+  }, 0);
+  const reassignedPixels = new Uint8Array(quantized.pixels);
+
+  for (let pixelIndex = 0; pixelIndex < reassignedPixels.length; pixelIndex += 1) {
+    if (
+      strokeMask[pixelIndex] === 1 ||
+      reassignedPixels[pixelIndex] !== strokePaletteIndex
+    ) {
+      continue;
+    }
+
+    const offset = pixelIndex * 3;
+    let nearestIndex = strokePaletteIndex;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (let paletteIndex = 0; paletteIndex < paletteLabs.length; paletteIndex += 1) {
+      if (paletteIndex === strokePaletteIndex) {
+        continue;
+      }
+
+      const distance = labDistance(
+        {
+          l: labs[offset],
+          a: labs[offset + 1],
+          b: labs[offset + 2]
+        },
+        paletteLabs[paletteIndex]
+      );
+
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = paletteIndex;
+      }
+    }
+
+    reassignedPixels[pixelIndex] = nearestIndex;
+  }
+
+  for (const pixelIndex of strokePixels) {
+    reassignedPixels[pixelIndex] = strokePaletteIndex;
+  }
+
+  const updatedPalette = quantized.palette.map((entry, index) =>
+    index === strokePaletteIndex
+      ? {
+          ...entry,
+          rgb: strokeRgb,
+          hex: rgbToHex(strokeRgb[0], strokeRgb[1], strokeRgb[2]),
+          lightness: adjustedStrokeLab.l
+        }
+      : entry
+  );
+
+  return {
+    palette: updatedPalette,
+    pixels: reassignedPixels,
+    strokeMask,
+    strokePaletteIndex
+  };
+};
+
+const reinforceStrokePixels = (
+  pixels: Uint8Array,
+  strokeMask?: Uint8Array,
+  strokePaletteIndex?: number
+) => {
+  if (!strokeMask || strokePaletteIndex === undefined) {
+    return pixels;
+  }
+
+  const reinforced = new Uint8Array(pixels);
+
+  for (let pixelIndex = 0; pixelIndex < reinforced.length; pixelIndex += 1) {
+    if (strokeMask[pixelIndex] === 1) {
+      reinforced[pixelIndex] = strokePaletteIndex;
+    }
+  }
+
+  return reinforced;
+};
+
+const buildPaletteIndexMask = (
+  pixels: Uint8Array,
+  paletteIndex?: number
+) => {
+  if (paletteIndex === undefined) {
+    return undefined;
+  }
+
+  const mask = new Uint8Array(pixels.length);
+
+  for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
+    if (pixels[pixelIndex] === paletteIndex) {
+      mask[pixelIndex] = 1;
+    }
+  }
+
+  return mask;
+};
+
+const mergeMasks = (
+  primaryMask?: Uint8Array,
+  secondaryMask?: Uint8Array
+) => {
+  if (!primaryMask) {
+    return secondaryMask;
+  }
+
+  if (!secondaryMask) {
+    return primaryMask;
+  }
+
+  const merged = new Uint8Array(primaryMask.length);
+
+  for (let pixelIndex = 0; pixelIndex < merged.length; pixelIndex += 1) {
+    if (primaryMask[pixelIndex] === 1 || secondaryMask[pixelIndex] === 1) {
+      merged[pixelIndex] = 1;
+    }
+  }
+
+  return merged;
+};
+
+const countStrokeMaskPixels = (strokeMask: Uint8Array) => {
+  let count = 0;
+
+  for (const pixel of strokeMask) {
+    if (pixel === 1) {
+      count += 1;
+    }
+  }
+
+  return count;
+};
+
+const chooseArtworkLinePaletteIndex = (
+  palette: PaletteEntry[],
+  imageProfile: ImageProfile
+) => {
+  if (imageProfile.renderingMode !== 'artwork' || palette.length < 4) {
+    return undefined;
+  }
+
+  const byLightness = [...palette].sort((left, right) => left.lightness - right.lightness);
+  const darkest = byLightness[0];
+  const secondDarkest = byLightness[1];
+  const secondLightest = byLightness[byLightness.length - 2];
+  const lightest = byLightness[byLightness.length - 1];
+
+  if (
+    lightest.usage <= 0.12 &&
+    lightest.lightness - secondLightest.lightness >= 4
+  ) {
+    return lightest.index;
+  }
+
+  if (
+    darkest.usage <= 0.12 &&
+    secondDarkest.lightness - darkest.lightness >= 4
+  ) {
+    return darkest.index;
+  }
+
+  return undefined;
 };
 
 const compactPaletteToUsedColors = (
@@ -863,7 +2222,8 @@ export const mergeSmallRegions = (
   height: number,
   minRegionPixels: number,
   sceneMap?: SceneMap,
-  cleanupStrength = 1
+  cleanupStrength = 1,
+  detailProtectionMap?: Float32Array
 ) => {
   const merged = new Uint8Array(pixels);
 
@@ -887,6 +2247,23 @@ export const mergeSmallRegions = (
     return samples === 0 ? 0 : total / samples;
   };
 
+  const getComponentDetailScore = (component: Component) => {
+    if (!detailProtectionMap || component.pixels.length === 0) {
+      return 0;
+    }
+
+    const stride = Math.max(1, Math.floor(component.pixels.length / 24));
+    let total = 0;
+    let samples = 0;
+
+    for (let index = 0; index < component.pixels.length; index += stride) {
+      total += detailProtectionMap[component.pixels[index]];
+      samples += 1;
+    }
+
+    return samples === 0 ? 0 : total / samples;
+  };
+
   const shouldMergeComponent = (component: Component) => {
     const regionWidth = component.maxX - component.minX + 1;
     const regionHeight = component.maxY - component.minY + 1;
@@ -894,12 +2271,23 @@ export const mergeSmallRegions = (
     const longSide = Math.max(regionWidth, regionHeight);
     const fillRatio = component.pixelCount / (regionWidth * regionHeight);
     const sceneScore = getComponentSceneScore(component);
+    const detailScore = getComponentDetailScore(component);
     const protection =
-      sceneScore * (0.5 + (1 - cleanupStrength) * 0.35);
+      sceneScore * (0.5 + (1 - cleanupStrength) * 0.35) +
+      detailScore * 0.72;
     const effectiveMinRegionPixels = Math.max(
       2,
       Math.round(minRegionPixels * (1 - protection))
     );
+
+    if (
+      detailScore > 0.5 &&
+      shortSide <= 2 &&
+      longSide >= 3 &&
+      component.pixelCount >= 2
+    ) {
+      return false;
+    }
 
     if (
       sceneScore > 0.52 &&
@@ -997,7 +2385,8 @@ export const smoothPixelAssignments = (
   width: number,
   height: number,
   cleanupStrength: number,
-  sceneMap?: SceneMap
+  sceneMap?: SceneMap,
+  detailProtectionMap?: Float32Array
 ) => {
   if (cleanupStrength <= 0.08) {
     return new Uint8Array(pixels);
@@ -1012,9 +2401,13 @@ export const smoothPixelAssignments = (
     const sceneScore = sceneMap
       ? sampleSceneScore(sceneMap, x + 0.5, y + 0.5)
       : 0;
-    const localCleanupStrength = cleanupStrength * (1 - sceneScore * 0.82);
+    const detailProtection = detailProtectionMap?.[pixelIndex] ?? 0;
+    const localCleanupStrength =
+      cleanupStrength *
+      (1 - sceneScore * 0.82) *
+      (1 - detailProtection * 0.9);
 
-    if (localCleanupStrength <= 0.08) {
+    if (localCleanupStrength <= 0.08 || detailProtection >= 0.78) {
       continue;
     }
 
@@ -1085,7 +2478,8 @@ const collapsePixelBlocks = (
   width: number,
   height: number,
   blockSize: number,
-  sceneMap?: SceneMap
+  sceneMap?: SceneMap,
+  detailProtectionMap?: Float32Array
 ) => {
   const collapsed = new Uint8Array(pixels);
 
@@ -1117,8 +2511,35 @@ const collapsePixelBlocks = (
             blockY + Math.min(blockSize, height - blockY) / 2
           )
         : 0;
+      let blockDetailScore = 0;
 
-      if (dominantColor === undefined || blockSceneScore > 0.46) {
+      if (detailProtectionMap) {
+        let detailTotal = 0;
+        let detailCount = 0;
+
+        for (
+          let y = blockY;
+          y < Math.min(height, blockY + blockSize);
+          y += 1
+        ) {
+          for (
+            let x = blockX;
+            x < Math.min(width, blockX + blockSize);
+            x += 1
+          ) {
+            detailTotal += detailProtectionMap[y * width + x];
+            detailCount += 1;
+          }
+        }
+
+        blockDetailScore = detailCount === 0 ? 0 : detailTotal / detailCount;
+      }
+
+      if (
+        dominantColor === undefined ||
+        blockSceneScore > 0.46 ||
+        blockDetailScore > 0.34
+      ) {
         continue;
       }
 
@@ -1148,7 +2569,8 @@ const convergeRegionCount = (
   minRegionPixels: number,
   targetRegionCount: number,
   cleanupStrength: number,
-  sceneMap?: SceneMap
+  sceneMap?: SceneMap,
+  detailProtectionMap?: Float32Array
 ) => {
   let merged = new Uint8Array(pixels);
   let mergeThreshold = minRegionPixels;
@@ -1174,7 +2596,8 @@ const convergeRegionCount = (
       height,
       mergeThreshold,
       sceneMap,
-      cleanupStrength
+      cleanupStrength,
+      detailProtectionMap
     );
 
     const postMergeComponents = labelComponents(merged, width, height);
@@ -1187,13 +2610,21 @@ const convergeRegionCount = (
       postMergeComponents.length > targetRegionCount * 2.5 &&
       tinyComponentRatio > 0.3
     ) {
-      merged = collapsePixelBlocks(merged, width, height, 2, sceneMap);
+      merged = collapsePixelBlocks(
+        merged,
+        width,
+        height,
+        2,
+        sceneMap,
+        detailProtectionMap
+      );
       merged = smoothPixelAssignments(
         merged,
         width,
         height,
         cleanupStrength,
-        sceneMap
+        sceneMap,
+        detailProtectionMap
       );
       merged = mergeSmallRegions(
         merged,
@@ -1201,9 +2632,56 @@ const convergeRegionCount = (
         height,
         mergeThreshold,
         sceneMap,
-        cleanupStrength
+        cleanupStrength,
+        detailProtectionMap
       );
+
+      const emergencyComponents = labelComponents(merged, width, height);
+
+      if (emergencyComponents.length > targetRegionCount * 2.2) {
+        merged = collapsePixelBlocks(merged, width, height, 2, sceneMap);
+        merged = smoothPixelAssignments(
+          merged,
+          width,
+          height,
+          cleanupStrength * 0.85,
+          sceneMap
+        );
+        merged = mergeSmallRegions(
+          merged,
+          width,
+          height,
+          Math.max(mergeThreshold, Math.round(minRegionPixels * 2.2)),
+          sceneMap,
+          cleanupStrength * 0.92
+        );
+      }
     }
+  }
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    const remainingComponents = labelComponents(merged, width, height);
+
+    if (remainingComponents.length <= targetRegionCount) {
+      return merged;
+    }
+
+    merged = collapsePixelBlocks(merged, width, height, 2, sceneMap);
+    merged = smoothPixelAssignments(
+      merged,
+      width,
+      height,
+      cleanupStrength * 0.82,
+      sceneMap
+    );
+    merged = mergeSmallRegions(
+      merged,
+      width,
+      height,
+      Math.max(mergeThreshold, Math.round(minRegionPixels * 2.4)),
+      sceneMap,
+      cleanupStrength * 0.88
+    );
   }
 
   return merged;
@@ -1543,64 +3021,153 @@ export const createPatternFromImageData = (
 ): PatternDocument => {
   const options = { ...DEFAULT_PATTERN_OPTIONS, ...overrides };
   const imageProfile = analyzeImageProfile(imageData, options.paletteSize);
+  const rawDetailProtectionMap = computeDetailProtectionMap(
+    imageData,
+    imageProfile
+  );
+  const detailProtectionMap = strengthenArtworkLineProtection(
+    imageData,
+    imageProfile,
+    rawDetailProtectionMap
+  );
+  const lineworkStrokeMask = buildLineworkStrokeMask(
+    imageData,
+    detailProtectionMap,
+    0
+  );
+  const lineworkStrokePixels = countStrokeMaskPixels(lineworkStrokeMask);
+  const hasDedicatedArtworkLinework =
+    imageProfile.renderingMode === 'artwork' &&
+    lineworkStrokePixels >=
+      Math.max(10, Math.round(lineworkStrokeMask.length * 0.006));
+  const workingImageData = normalizeArtworkBackground(
+    imageData,
+    imageProfile,
+    detailProtectionMap
+  );
   const effectiveOptions = {
     ...options,
-    paletteSize: imageProfile.effectivePaletteSize,
+    paletteSize: Math.min(
+      options.paletteSize,
+      imageProfile.effectivePaletteSize + (hasDedicatedArtworkLinework ? 1 : 0)
+    ),
     minRegionPixels: Math.max(
-      2,
-      Math.round(options.minRegionPixels * imageProfile.minRegionScale)
+      hasDedicatedArtworkLinework ? 1 : 2,
+      Math.round(
+        options.minRegionPixels *
+          imageProfile.minRegionScale *
+          (imageProfile.renderingMode === 'artwork' ? 0.74 : 1)
+      )
     ),
     targetRegionCount: Math.max(
       24,
-      Math.round(options.targetRegionCount * imageProfile.targetRegionScale)
+      Math.round(
+        options.targetRegionCount *
+          imageProfile.targetRegionScale *
+          (imageProfile.renderingMode === 'artwork' ? 1.45 : 1)
+      )
     ),
     cleanupStrength: clamp01(
-      options.cleanupStrength * imageProfile.cleanupStrengthScale
+      options.cleanupStrength *
+        imageProfile.cleanupStrengthScale *
+        (imageProfile.renderingMode === 'artwork' ? 0.55 : 1)
     )
   };
-  const sceneMap = analyzeSceneMap(imageData);
-  const quantized = quantizeImageData(imageData, effectiveOptions);
-  const smoothed = smoothPixelAssignments(
-    quantized.pixels,
-    imageData.width,
-    imageData.height,
-    effectiveOptions.cleanupStrength,
-    sceneMap
+  const sceneMap = analyzeSceneMap(workingImageData);
+  const quantized = quantizeImageData(
+    workingImageData,
+    effectiveOptions,
+    imageProfile,
+    detailProtectionMap
   );
-  const pixels = mergeSmallRegions(
-    smoothed,
-    imageData.width,
-    imageData.height,
-    effectiveOptions.minRegionPixels,
-    sceneMap,
-    effectiveOptions.cleanupStrength
+  const quantizedLinePaletteIndex = chooseArtworkLinePaletteIndex(
+    quantized.palette,
+    imageProfile
   );
-  const convergedPixels = convergeRegionCount(
-    pixels,
-    imageData.width,
-    imageData.height,
-    effectiveOptions.minRegionPixels,
-    effectiveOptions.targetRegionCount,
-    effectiveOptions.cleanupStrength,
-    sceneMap
+  const protectedQuantized =
+    quantizedLinePaletteIndex !== undefined
+      ? {
+          ...quantized,
+          strokePaletteIndex: quantizedLinePaletteIndex,
+          strokeMask: buildPaletteIndexMask(
+            quantized.pixels,
+            quantizedLinePaletteIndex
+          )
+        }
+      : reserveLineworkStrokePaletteSlot(
+          workingImageData,
+          quantized,
+          imageProfile,
+          detailProtectionMap
+        );
+  const fallbackLinePaletteIndex = chooseArtworkLinePaletteIndex(
+    protectedQuantized.palette,
+    imageProfile
+  );
+  const fallbackLineMask = buildPaletteIndexMask(
+    protectedQuantized.pixels,
+    fallbackLinePaletteIndex
+  );
+  const preserveDirectIllustrationLinework =
+    imageProfile.renderingMode === 'artwork' &&
+    fallbackLinePaletteIndex !== undefined &&
+    protectedQuantized.palette.length <= Math.min(6, options.paletteSize) &&
+    imageProfile.flatArtworkScore > 0.45;
+  const smoothed = preserveDirectIllustrationLinework
+    ? new Uint8Array(protectedQuantized.pixels)
+    : smoothPixelAssignments(
+        protectedQuantized.pixels,
+        workingImageData.width,
+        workingImageData.height,
+        effectiveOptions.cleanupStrength,
+        sceneMap,
+        detailProtectionMap
+      );
+  const pixels = preserveDirectIllustrationLinework
+    ? smoothed
+    : mergeSmallRegions(
+        smoothed,
+        workingImageData.width,
+        workingImageData.height,
+        effectiveOptions.minRegionPixels,
+        sceneMap,
+        effectiveOptions.cleanupStrength,
+        detailProtectionMap
+      );
+  const convergedPixels = preserveDirectIllustrationLinework
+    ? pixels
+    : convergeRegionCount(
+        pixels,
+        workingImageData.width,
+        workingImageData.height,
+        effectiveOptions.minRegionPixels,
+        effectiveOptions.targetRegionCount,
+        effectiveOptions.cleanupStrength,
+        sceneMap,
+        detailProtectionMap
+      );
+  const lineReinforcedPixels = reinforceStrokePixels(
+    convergedPixels,
+    mergeMasks(protectedQuantized.strokeMask, fallbackLineMask),
+    protectedQuantized.strokePaletteIndex ?? fallbackLinePaletteIndex
   );
   const normalized = mergeSimilarPaletteEntries(
-    quantized.palette,
-    convergedPixels,
+    protectedQuantized.palette,
+    lineReinforcedPixels,
     imageProfile.paletteMergeDistance
   );
   const components = labelComponents(
     normalized.pixels,
-    imageData.width,
-    imageData.height
+    workingImageData.width,
+    workingImageData.height
   );
   const regions: PatternRegion[] = components.map((component, index) => {
     const { label, labelRadius } = chooseLabelPoint(
       component,
-      imageData.width,
-      imageData.height
+      workingImageData.width,
+      workingImageData.height
     );
-    const loops = extractLoops(component, imageData.width);
+    const loops = extractLoops(component, workingImageData.width);
 
     return {
       id: index,
@@ -1621,16 +3188,16 @@ export const createPatternFromImageData = (
   });
 
   return {
-    width: imageData.width,
-    height: imageData.height,
+    width: workingImageData.width,
+    height: workingImageData.height,
     originalWidth: originalSize.width,
     originalHeight: originalSize.height,
     palette: normalized.palette,
     pixels: normalized.pixels,
     regions,
     detailWindows: chooseDetailWindows(
-      imageData.width,
-      imageData.height,
+      workingImageData.width,
+      workingImageData.height,
       regions,
       effectiveOptions
     )

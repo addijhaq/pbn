@@ -61,6 +61,56 @@ describe('quantizeImageData', () => {
     expect(quantized.palette).toHaveLength(8);
     expect(Math.max(...quantized.pixels)).toBeLessThan(8);
   });
+
+  it('preserves minority accent greens and bright line colors in illustrative art', () => {
+    const imageData = createImageData(24, 24, (x, y) => {
+      if (x >= 8 && x <= 15 && y >= 7 && y <= 20) {
+        if ((x === 11 || x === 12) && y >= 10 && y <= 18) {
+          return [244, 241, 232];
+        }
+
+        return [20, 20, 24];
+      }
+
+      if (y <= 5 && (x <= 7 || x >= 16)) {
+        return [187, 118, 150];
+      }
+
+      if (y >= 16 && x <= 8) {
+        return x <= 4 ? [94, 104, 57] : [130, 144, 86];
+      }
+
+      if (y >= 16 && x >= 15) {
+        return x >= 19 ? [94, 104, 57] : [130, 144, 86];
+      }
+
+      return [206, 194, 166];
+    });
+    const profile = analyzeImageProfile(imageData, 8);
+    const quantized = quantizeImageData(
+      imageData,
+      {
+        paletteSize: 8,
+        workingMaxDimension: 280,
+        minRegionPixels: 1,
+        maxKMeansIterations: 12,
+        maxDetailPages: 4,
+        detailGrid: 3,
+        targetRegionCount: 80,
+        cleanupStrength: 0.35
+      },
+      profile
+    );
+    const greenEntries = quantized.palette.filter(
+      (entry) => entry.rgb[1] >= entry.rgb[0] + 8 && entry.rgb[1] >= entry.rgb[2] + 4
+    );
+    const brightEntries = quantized.palette.filter(
+      (entry) => entry.rgb[0] >= 228 && entry.rgb[1] >= 228 && entry.rgb[2] >= 220
+    );
+
+    expect(greenEntries.length).toBeGreaterThanOrEqual(2);
+    expect(brightEntries.length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe('buildPathString', () => {
@@ -126,6 +176,7 @@ describe('analyzeImageProfile', () => {
     const profile = analyzeImageProfile(imageData, 12);
 
     expect(profile.monochromeScore).toBeGreaterThan(0.7);
+    expect(profile.renderingMode).toBe('artwork');
     expect(profile.effectivePaletteSize).toBeLessThanOrEqual(4);
   });
 });
@@ -221,6 +272,224 @@ describe('createPatternFromImageData', () => {
 
     expect(pattern.palette).toHaveLength(3);
     expect(paletteNumbers).toEqual([1, 2, 3]);
+  });
+
+  it('flattens textured artwork backgrounds while preserving bright linework', () => {
+    const imageData = createImageData(28, 28, (x, y) => {
+      const backgroundShift = ((x * 3 + y * 5) % 4) * 4;
+      const background: [number, number, number] = [
+        46 + backgroundShift,
+        48 + backgroundShift,
+        58 + backgroundShift
+      ];
+      const dx = (x - 14) / 8.2;
+      const dy = (y - 13) / 7;
+      const insideBody = dx * dx + dy * dy <= 1;
+      const tailDx = (x - 16) / 4.5;
+      const tailDy = (y - 20) / 5.2;
+      const insideTail = tailDx * tailDx + tailDy * tailDy <= 1;
+      const insideFox = insideBody || insideTail;
+      const stitch =
+        insideFox &&
+        (((x + y) % 5 === 0 && y >= 7 && y <= 21) ||
+          (Math.abs(x - 14) <= 1 && y >= 8 && y <= 18) ||
+          (Math.abs(y - 12) <= 1 && x >= 8 && x <= 19));
+
+      if (stitch) {
+        return [242, 240, 228];
+      }
+
+      if (insideFox) {
+        return [60, 60, 68];
+      }
+
+      return background;
+    });
+
+    const pattern = createPatternFromImageData(imageData, {
+      paletteSize: 8,
+      minRegionPixels: 1,
+      targetRegionCount: 120,
+      cleanupStrength: 0.4
+    });
+    const borderPalette = new Set<number>();
+
+    for (let y = 0; y < pattern.height; y += 1) {
+      for (let x = 0; x < pattern.width; x += 1) {
+        if (x === 0 || y === 0 || x === pattern.width - 1 || y === pattern.height - 1) {
+          borderPalette.add(pattern.pixels[y * pattern.width + x]);
+        }
+      }
+    }
+
+    const lightestPaletteIndex = pattern.palette.reduce(
+      (bestIndex, entry, index) =>
+        entry.lightness > pattern.palette[bestIndex].lightness ? index : bestIndex,
+      0
+    );
+    let lightStrokePixels = 0;
+
+    for (const pixel of pattern.pixels) {
+      if (pixel === lightestPaletteIndex) {
+        lightStrokePixels += 1;
+      }
+    }
+
+    expect(borderPalette.size).toBe(1);
+    expect(borderPalette.has(lightestPaletteIndex)).toBe(false);
+    expect(lightStrokePixels).toBeGreaterThanOrEqual(12);
+  });
+
+  it('preserves bright interior linework in colorful illustration subjects', () => {
+    const imageData = createImageData(28, 28, (x, y) => {
+      const background: [number, number, number] = [227, 216, 190];
+      const dxLeft = (x - 9) / 4.8;
+      const dyLeft = (y - 14) / 7.5;
+      const dxRight = (x - 19) / 4.8;
+      const dyRight = (y - 14) / 7.5;
+      const insideBird = dxLeft * dxLeft + dyLeft * dyLeft <= 1 || dxRight * dxRight + dyRight * dyRight <= 1;
+      const wingLine =
+        ((x >= 7 && x <= 11 && Math.abs(y - (x + 6)) <= 1) ||
+          (x >= 17 && x <= 21 && Math.abs(y - (-x + 32)) <= 1)) &&
+        y >= 10 &&
+        y <= 21;
+      const eyeAndBeak =
+        ((x === 10 || x === 18) && y === 10) ||
+        ((x >= 11 && x <= 13) && y === 11) ||
+        ((x >= 15 && x <= 17) && y === 11);
+      const flower =
+        y <= 6 && ((x >= 3 && x <= 7) || (x >= 20 && x <= 24));
+      const leaf =
+        y >= 17 && ((x >= 5 && x <= 9) || (x >= 18 && x <= 22));
+
+      if (wingLine || eyeAndBeak) {
+        return [243, 240, 227];
+      }
+
+      if (insideBird) {
+        return [24, 24, 26];
+      }
+
+      if (flower) {
+        return [201, 130, 162];
+      }
+
+      if (leaf) {
+        return [119, 123, 76];
+      }
+
+      return background;
+    });
+
+    const pattern = createPatternFromImageData(imageData, {
+      paletteSize: 8,
+      minRegionPixels: 1,
+      targetRegionCount: 180,
+      cleanupStrength: 0.2
+    });
+    const maxLightness = Math.max(...pattern.palette.map((entry) => entry.lightness));
+    const brightIndices = pattern.palette
+      .filter((entry) => entry.lightness >= maxLightness - 6)
+      .map((entry) => entry.index);
+    const strokeSamplePoints = [
+      { x: 8, y: 14 },
+      { x: 10, y: 16 },
+      { x: 18, y: 14 },
+      { x: 20, y: 12 },
+      { x: 10, y: 10 },
+      { x: 18, y: 10 }
+    ];
+    let brightPixelCount = 0;
+    let preservedStrokeSamples = 0;
+
+    for (const pixel of pattern.pixels) {
+      if (brightIndices.includes(pixel)) {
+        brightPixelCount += 1;
+      }
+    }
+
+    for (const point of strokeSamplePoints) {
+      const paletteIndex = pattern.pixels[point.y * pattern.width + point.x];
+
+      if (brightIndices.includes(paletteIndex)) {
+        preservedStrokeSamples += 1;
+      }
+    }
+
+    expect(brightIndices.length).toBeGreaterThanOrEqual(1);
+    expect(brightPixelCount).toBeGreaterThanOrEqual(24);
+    expect(preservedStrokeSamples).toBeGreaterThanOrEqual(4);
+  });
+
+  it('keeps multiple green leaf shades in illustrative palettes alongside floral accents', () => {
+    const imageData = createImageData(34, 34, (x, y) => {
+      const background: [number, number, number] = [227, 216, 190];
+      const leftBird =
+        ((x - 11) / 5.2) ** 2 + ((y - 15) / 8.6) ** 2 <= 1;
+      const rightBird =
+        ((x - 23) / 5.2) ** 2 + ((y - 15) / 8.6) ** 2 <= 1;
+      const wingLine =
+        (((x >= 9 && x <= 13) && Math.abs(y - (x + 5)) <= 1) ||
+          ((x >= 21 && x <= 25) && Math.abs(y - (-x + 36)) <= 1)) &&
+        y >= 11 &&
+        y <= 24;
+      const centralLeaf =
+        y >= 14 &&
+        y <= 27 &&
+        Math.abs(x - 17) <= Math.max(1, Math.floor((27 - y) / 4));
+      const lowerLeafShadow =
+        y >= 22 &&
+        ((x >= 6 && x <= 11) || (x >= 22 && x <= 27));
+      const lowerLeafHighlight =
+        y >= 20 &&
+        y <= 26 &&
+        ((x >= 8 && x <= 12) || (x >= 21 && x <= 25));
+      const flower =
+        y <= 8 &&
+        (((x >= 3 && x <= 9) && (x + y) % 2 === 0) ||
+          ((x >= 24 && x <= 30) && (x + y) % 2 === 0));
+
+      if (wingLine) {
+        return [243, 240, 227];
+      }
+
+      if (leftBird || rightBird) {
+        return [24, 24, 26];
+      }
+
+      if (flower) {
+        return x % 3 === 0 ? [205, 129, 163] : [187, 109, 145];
+      }
+
+      if (centralLeaf || lowerLeafHighlight) {
+        return [133, 141, 88];
+      }
+
+      if (lowerLeafShadow) {
+        return [94, 104, 57];
+      }
+
+      return background;
+    });
+
+    const pattern = createPatternFromImageData(imageData, {
+      paletteSize: 8,
+      minRegionPixels: 1,
+      targetRegionCount: 180,
+      cleanupStrength: 0.2
+    });
+    const greenEntries = pattern.palette.filter(
+      (entry) =>
+        entry.rgb[1] >= entry.rgb[0] + 8 && entry.rgb[1] >= entry.rgb[2] + 2
+    );
+    const greenLightnesses = greenEntries
+      .map((entry) => entry.lightness)
+      .sort((left, right) => left - right);
+
+    expect(greenEntries.length).toBeGreaterThanOrEqual(2);
+    expect(
+      greenLightnesses[greenLightnesses.length - 1] - greenLightnesses[0]
+    ).toBeGreaterThanOrEqual(4);
   });
 });
 
